@@ -517,15 +517,25 @@ def main() -> None:
     rois = load_rois(args.rois, cal["H_field"], cal["K"], cal["D"], cal["model"],
                      args.roi_distorted)
 
-    # The plane the sticker is read on. Synthesised at this vehicle's marker
-    # height when the survey solved a camera pose, because that is exact for
-    # this car; the stored car plane is right only at the height it was set to.
-    if cal["R"] is not None:
+    # The plane the sticker is read on. A surveyed car plane wins at the height
+    # it was surveyed at: it measured the geometry with poles instead of
+    # trusting the pose to be exact. It is right only at that one height, so a
+    # marker at any other height falls back to raising Z through the pose,
+    # which is exact for this car if the pose is.
+    stored_h = float(cal["car_height_stored"])
+    if (cal["car_stored"] is not None
+            and abs(stored_h - car["sticker_height_mm"]) <= 1.0):
+        H_car = cal["car_stored"]
+        plane_note = f"surveyed car plane @ {stored_h:.0f} mm"
+    elif cal["R"] is not None:
         H_car = homography_at_height(cal["K"], cal["R"], cal["t"], car["sticker_height_mm"])
         plane_note = f"synthesised @ {car['sticker_height_mm']:.0f} mm"
+        if cal["car_stored"] is not None:
+            plane_note += f" (surveyed plane is at {stored_h:.0f} mm, not this height)"
     elif cal["car_stored"] is not None:
         H_car = cal["car_stored"]
-        plane_note = f"surveyed car plane @ {cal['car_height_stored']:.0f} mm"
+        plane_note = f"surveyed car plane @ {stored_h:.0f} mm, but this marker sits at "\
+                     f"{car['sticker_height_mm']:.0f} mm"
     else:
         raise SystemExit(
             "calibration has neither a camera pose nor a car plane, so the sticker could "

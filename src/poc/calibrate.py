@@ -8,6 +8,7 @@ you choose, so a whole site lives in one directory.
     1  intrinsics  checkerboard video      -> intrinsics.json
     2  gcp         click ground points     -> calibration.json
     3  measure     check it against a tape (no output; do this before trusting it)
+    3b carplane    survey the marker's plane  -> car block in calibration.json
     4  sticker     cut the marker template -> sticker.png + sticker.json
     5  car         vehicle geometry        -> car.json
     6  roi         draw what to measure to -> rois.json
@@ -43,6 +44,17 @@ import picker
 # --------------------------------------------------------------------------
 # shared helpers
 # --------------------------------------------------------------------------
+
+
+# OpenCV 5 moved the fisheye calibration flags onto the top-level namespace;
+# 4.x has them under cv2.fisheye. Look in both so one file runs on either.
+_FISHEYE_CALIB_FLAGS = (
+    getattr(cv2, "CALIB_RECOMPUTE_EXTRINSIC", None)
+    or getattr(cv2.fisheye, "CALIB_RECOMPUTE_EXTRINSIC", 0)
+) | (
+    getattr(cv2, "CALIB_FIX_SKEW", None)
+    or getattr(cv2.fisheye, "CALIB_FIX_SKEW", 0)
+)
 
 
 def load_json(path: Path) -> dict:
@@ -157,6 +169,116 @@ def calibration_planes(cal: dict):
     return K, model, np.array(pose["rotation"]), np.array(pose["translation_mm"])
 
 
+#: No camera in this application is anywhere near this high. A fit implying more
+#: means the two levels are barely separated — the signature of targets that
+#: never actually left the ground. Testing the recovered height rather than the
+#: raw scale keeps the check physical: k approaches 1 smoothly, so any epsilon
+#: on it is arbitrary, while a 200 m mast is plainly absurd.
+MAX_CAMERA_MM = 200_000.0
+
+
+def fit_homology(shadow_mm, world_mm):
+    """Least-squares ``shadow = k * world + b`` — linear in ``(k, bx, by)``."""
+    n = len(world_mm)
+    A = np.zeros((2 * n, 3), dtype=np.float64)
+    A[0::2, 0], A[0::2, 1] = world_mm[:, 0], 1.0
+    A[1::2, 0], A[1::2, 2] = world_mm[:, 1], 1.0
+    sol, *_ = np.linalg.lstsq(A, shadow_mm.reshape(-1), rcond=None)
+    return float(sol[0]), sol[1:]
+
+
+def car_plane_from_field(H_field, pixels, world_mm, height_mm: float) -> dict:
+    """Solve the car plane as a homology of the field plane, from as few as two targets.
+
+    A free plane homography has eight degrees of freedom and needs four points.
+    The car plane is not free: it is parallel to the ground at a known height,
+    so once the field plane is known the only unknowns are a scale ``k`` and
+    the camera's ground position — three numbers. A point at height ``h`` over
+    world ``(X, Y)`` is seen along the ray from the camera centre, which meets
+    the ground at::
+
+        (X', Y') = C_xy + k * ((X, Y) - C_xy),      k = cz / (cz - h)
+
+    — a uniform scaling about where the camera stands, with no rotation. So two
+    targets give four equations for three unknowns, already one more than
+    required, and a homology cannot represent a "car plane" tilted relative to
+    the ground, which no camera can actually see.
+
+    The trade against raising Z through the pose is real in both directions.
+    This inherits whatever error the field plane carries, but it measures the
+    plane the marker rides on instead of assuming the pose is exact, and the
+    camera height it recovers can be checked against a tape on the mast.
+    """
+    H_field = np.asarray(H_field, dtype=np.float64)
+    pixels = np.asarray(pixels, dtype=np.float64).reshape(-1, 2)
+    world_mm = np.asarray(world_mm, dtype=np.float64).reshape(-1, 2)
+    if len(pixels) != len(world_mm):
+        raise SystemExit("every car target needs a world coordinate")
+    if len(pixels) < 2:
+        raise SystemExit(f"the car plane needs at least 2 targets, got {len(pixels)}")
+    if height_mm <= 0:
+        raise SystemExit(f"car plane height must be above the ground, got {height_mm} mm")
+
+    # Where each raised target appears to stand when read through the ground.
+    shadow = apply_h(H_field, pixels)
+    if not np.isfinite(shadow).all():
+        raise SystemExit(
+            "a car target maps to infinity through the field plane — it is on the "
+            "horizon, where the ground mapping diverges"
+        )
+
+    k, b = fit_homology(shadow, world_mm)
+    if not np.isfinite(k) or k <= 1.0:
+        raise SystemExit(
+            f"the targets imply a scale of {k:.6f}; a camera looking down on a plane "
+            f"{height_mm:.0f} mm up must give more than 1. Check that the targets really "
+            "are at sticker height and that their world coordinates are the ground marks "
+            "directly below them."
+        )
+    camera_height = k * height_mm / (k - 1.0)
+    if camera_height > MAX_CAMERA_MM:
+        raise SystemExit(
+            f"the targets imply a camera {camera_height / 1000:.0f} m above the ground, so "
+            f"they are barely displaced from the marks below them. Targets still lying on "
+            f"the ground give exactly this — check they were raised to {height_mm:.0f} mm."
+        )
+
+    # world_car = (world_field - b) / k
+    M = np.array([[1.0 / k, 0.0, -b[0] / k], [0.0, 1.0 / k, -b[1] / k], [0.0, 0.0, 1.0]])
+    H_car = M @ H_field
+
+    res = np.linalg.norm(apply_h(H_car, pixels) - world_mm, axis=1)
+    camera_xy = b / (1.0 - k)
+    return {
+        "homography": H_car,
+        "scale": k,
+        "camera_ground_mm": [float(camera_xy[0]), float(camera_xy[1])],
+        "camera_height_mm": float(camera_height),
+        "residuals_mm": [float(d) for d in res],
+        "rms_mm": float(np.sqrt(np.mean(res ** 2))),
+        "max_mm": float(res.max()),
+    }
+
+
+def car_plane(cal: dict, height_mm: float):
+    """The plane to read a marker on at ``height_mm``, and a note on where it came from.
+
+    A surveyed car plane wins at the height it was surveyed at, because it
+    measured the geometry instead of assuming the pose is exact. It is only
+    right at that one height, though, so a marker at any other height falls
+    back to raising Z through the pose.
+    """
+    K, _, R, t = calibration_planes(cal)
+    stored = cal.get("car")
+    if stored and abs(float(stored["height_mm"]) - float(height_mm)) <= 1.0:
+        H = np.array(stored["homography"], dtype=np.float64)
+        return H, f"surveyed car plane @ {float(stored['height_mm']):.0f} mm"
+    note = f"synthesised @ {height_mm:.0f} mm"
+    if stored:
+        note += f" (surveyed plane is at {float(stored['height_mm']):.0f} mm, not this height)"
+    return homography_at_height(K, R, t, height_mm), note
+
+
 def bev_around(und, H_plane, centre_mm, span_mm, mm_per_px):
     """A metric bird's-eye raster of one square of ground, centred on a point.
 
@@ -215,6 +337,14 @@ def cmd_intrinsics(a) -> None:
     the board has actually moved since the last accepted one — a hundred frames
     of the same pose constrain nothing, and they make the reported RMS look
     better while the calibration gets no better at all.
+
+    ``--model`` picks the lens model, and it has to match the lens. The pinhole
+    model's two radial terms cannot represent a wide fisheye: the fit converges,
+    reports a plausible RMS on the views it was given, and then bends straight
+    lines near the frame edge. Every consumer in this tool reads the ``model``
+    field written here and undistorts accordingly, so the choice made at this
+    step follows the calibration everywhere — which is also why it must not be
+    guessed. If straight edges stay straight after ``frame``, it is pinhole.
     """
     cols, rows = (int(v) for v in a.board.lower().split("x"))
     pattern = (cols, rows)
@@ -269,14 +399,26 @@ def cmd_intrinsics(a) -> None:
             "and shoot the board at more angles and distances, pausing at each pose."
         )
 
-    rms, K, D, _, _ = cv2.calibrateCamera(obj_pts, img_pts, size, None, None)
-    print(f"  reprojection RMS {rms:.4f} px over {len(obj_pts)} views")
+    if a.model == "fisheye":
+        # The fisheye fitter is strict where the pinhole one is forgiving: it
+        # wants (1, N, ...) float64 for both point sets, and rejects the
+        # (N, 1, ...) float32 arrays findChessboardCorners hands back.
+        obj_f = [o.reshape(1, -1, 3).astype(np.float64) for o in obj_pts]
+        img_f = [i.reshape(1, -1, 2).astype(np.float64) for i in img_pts]
+        K, D = np.zeros((3, 3)), np.zeros((4, 1))
+        rms, K, D, _, _ = cv2.fisheye.calibrate(
+            obj_f, img_f, size, K, D,
+            flags=_FISHEYE_CALIB_FLAGS,
+            criteria=(cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 50, 1e-6))
+    else:
+        rms, K, D, _, _ = cv2.calibrateCamera(obj_pts, img_pts, size, None, None)
+    print(f"  {a.model} model, reprojection RMS {rms:.4f} px over {len(obj_pts)} views")
     if rms > 1.0:
         print("  NOTE: RMS above 1 px. The usual cause is a rolling shutter: a board swept "
               "through the frame comes back sheared and pin-sharp, so the blur gate misses "
               "it. Pause at every pose and re-shoot.", flush=True)
     save_json(a.out, {
-        "model": "pinhole",
+        "model": a.model,
         "camera_matrix": K.tolist(),
         "dist_coeffs": D.ravel().tolist(),
         "image_width": int(size[0]),
@@ -405,6 +547,97 @@ def cmd_measure(a) -> None:
 
 
 # --------------------------------------------------------------------------
+# 3b. carplane — measure the plane the marker rides on
+# --------------------------------------------------------------------------
+
+
+def cmd_carplane(a) -> None:
+    """Survey the marker's plane directly, instead of raising Z through the pose.
+
+    Stand a pole at the marker height over each of two or more ground marks and
+    click the top of each one. The world coordinate you type is the *ground
+    mark beneath the pole*, not the pole top — the displacement between the two
+    is exactly the parallax this plane exists to remove, and it is what the fit
+    reads the camera out of.
+
+    Intrinsics do the same two jobs here as everywhere else in this tool: they
+    undistort the frame you click on, and with the pose they give the field
+    homography this plane is a homology of. Because both are present, the fit
+    can be checked in a way the survey alone cannot — the camera height it
+    recovers is compared against the pose, and the two disagreeing means one of
+    the surveys is wrong.
+
+    Writes a ``car`` block into the calibration file, in place unless you pass
+    ``--out``. Both pipelines pick it up on their own for a marker at this
+    height.
+    """
+    cal = load_json(a.calibration)
+    K, _, R, t = calibration_planes(cal)
+    H_field = homography_at_height(K, R, t, 0.0)
+    und = undistort(load_image(a.image), cal["intrinsics"], str(a.image))
+
+    picked = picker.pick_points(
+        und, f"Car-plane targets at {a.height_mm:.0f} mm — click each pole top, "
+             "type the world X,Y of the mark beneath it",
+        world=True, hint="2 minimum; 3 or more makes the residual a real check",
+        open_browser=not a.no_open)
+    if not picked:
+        raise SystemExit("cancelled — nothing surveyed")
+
+    pixels = np.array([p["px"] for p in picked], dtype=np.float64)
+    world = np.array([p["world_mm"] for p in picked], dtype=np.float64)
+    fit = car_plane_from_field(H_field, pixels, world, a.height_mm)
+
+    pose_centre = (-np.asarray(R).T @ np.asarray(t))
+    print(f"  scale k {fit['scale']:.6f}  ->  parallax {1000 * (fit['scale'] - 1):.0f} mm "
+          f"per metre from the camera")
+    print(f"  camera over ({fit['camera_ground_mm'][0]:.0f}, {fit['camera_ground_mm'][1]:.0f}) mm "
+          f"at {fit['camera_height_mm']:.0f} mm")
+    print(f"  pose says  ({pose_centre[0]:.0f}, {pose_centre[1]:.0f}) mm "
+          f"at {pose_centre[2]:.0f} mm")
+    print(f"  fit residual rms {fit['rms_mm']:.1f} mm  max {fit['max_mm']:.1f} mm")
+    for p, r in zip(picked, fit["residuals_mm"], strict=True):
+        print(f"    ({p['world_mm'][0]:8.1f}, {p['world_mm'][1]:8.1f}) mm   {r:6.1f} mm")
+
+    if len(picked) < 3:
+        print("  NOTE: 2 targets fit 3 parameters with almost nothing to spare, so the "
+              "residual barely tests the survey. A third target makes it a real check.",
+              flush=True)
+    if fit["max_mm"] > a.max_residual_mm:
+        raise SystemExit(
+            f"car-plane residual too large: worst target off by {fit['max_mm']:.1f} mm "
+            f"(limit {a.max_residual_mm:.1f} mm). Check that every target stood at the "
+            "same height and above the mark it names."
+        )
+
+    drop = abs(fit["camera_height_mm"] - pose_centre[2])
+    if drop > a.max_camera_disagreement_mm:
+        print(f"  NOTE: this survey and the camera pose disagree about the camera height by "
+              f"{drop:.0f} mm. They are independent measurements of the same mast, so one of "
+              f"them is wrong — check the pole height and the ground marks before trusting "
+              f"either plane.", flush=True)
+
+    cal["car"] = {
+        "name": "car",
+        "height_mm": float(a.height_mm),
+        "homography": fit["homography"].tolist(),
+        "fit_model": "homology",
+        "scale": fit["scale"],
+        "camera_ground_mm": fit["camera_ground_mm"],
+        "camera_height_mm": fit["camera_height_mm"],
+        "pose_camera_height_mm": float(pose_centre[2]),
+        "rms_error_mm": fit["rms_mm"],
+        "max_error_mm": fit["max_mm"],
+        "targets": [{"pixel": {"x": p["px"][0], "y": p["px"][1]},
+                     "world": {"x_mm": p["world_mm"][0], "y_mm": p["world_mm"][1]},
+                     "residual_mm": r}
+                    for p, r in zip(picked, fit["residuals_mm"], strict=True)],
+    }
+    save_json(a.out or a.calibration, cal)
+    print("  next: cut the sticker template at this height", flush=True)
+
+
+# --------------------------------------------------------------------------
 # 4. sticker template
 # --------------------------------------------------------------------------
 
@@ -423,8 +656,8 @@ def cmd_sticker(a) -> None:
     and shears it, so do not feed one to a pipeline expecting metric pixels.
     """
     cal = load_json(a.calibration)
-    K, _, R, t = calibration_planes(cal)
-    H_car = homography_at_height(K, R, t, a.height_mm)
+    H_car, plane_note = car_plane(cal, a.height_mm)
+    print(f"  marker plane: {plane_note}")
     und = undistort(load_image(a.image), cal["intrinsics"], str(a.image))
 
     if a.space == "raw":
@@ -500,8 +733,8 @@ def cmd_car(a) -> None:
     it. Clicking the nose is what makes it impossible to get backwards.
     """
     cal = load_json(a.calibration)
-    K, _, R, t = calibration_planes(cal)
-    H_car = homography_at_height(K, R, t, a.sticker_height_mm)
+    H_car, plane_note = car_plane(cal, a.sticker_height_mm)
+    print(f"  marker plane: {plane_note}")
     und = undistort(load_image(a.image), cal["intrinsics"], str(a.image))
 
     seed = picker.pick_points(und, "Click the marker on the roof", n=1,
@@ -623,6 +856,8 @@ def main() -> None:
     p.add_argument("--every", type=int, default=5, help="Look at every Nth frame.")
     p.add_argument("--min-sharpness", type=float, default=60.0, help="Laplacian variance floor.")
     p.add_argument("--max-views", type=int, default=40)
+    p.add_argument("--model", choices=("pinhole", "fisheye"), default="pinhole",
+                   help="Lens model to fit. Must match the lens; see the step description.")
 
     p = add("gcp", cmd_gcp, "2. click ground points -> calibration.json")
     p.add_argument("--image", required=True, type=Path)
@@ -633,6 +868,16 @@ def main() -> None:
     p.add_argument("--image", required=True, type=Path)
     p.add_argument("--calibration", required=True, type=Path)
     p.add_argument("--height-mm", type=float, default=0.0, help="Plane to measure on.")
+
+    p = add("carplane", cmd_carplane, "3b. survey the plane the marker rides on")
+    p.add_argument("--image", required=True, type=Path)
+    p.add_argument("--calibration", required=True, type=Path)
+    p.add_argument("--height-mm", required=True, type=float, help="Target height above ground.")
+    p.add_argument("--out", type=Path, default=None,
+                   help="Default: update the calibration file in place.")
+    p.add_argument("--max-residual-mm", type=float, default=20.0)
+    p.add_argument("--max-camera-disagreement-mm", type=float, default=500.0,
+                   help="Warn if this survey and the pose disagree about the camera height.")
 
     p = add("sticker", cmd_sticker, "4. cut the marker template")
     p.add_argument("--image", required=True, type=Path)

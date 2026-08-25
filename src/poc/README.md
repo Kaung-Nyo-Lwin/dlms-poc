@@ -6,7 +6,7 @@ nothing imports `dlms`.**
 
 | file | what it does |
 |---|---|
-| `calibrate.py` | the survey tool — all six steps, one folder of files |
+| `calibrate.py` | the survey tool — every step, one folder of files |
 | `picker.py` | the browser picking widget the survey steps use |
 | `pipeline1_bev.py` | warp each frame to the car plane, then match |
 | `pipeline2_raw.py` | match in the camera frame, then map the centre |
@@ -29,6 +29,8 @@ python calibrate.py intrinsics --video $S/checkerboard.mp4 --board 11x7 --square
 python calibrate.py gcp        --image $S/frame.png --intrinsics $S/intrinsics.json \
                                --out $S/calibration.json
 python calibrate.py measure    --image $S/frame.png --calibration $S/calibration.json
+python calibrate.py carplane   --image $S/frame.png --calibration $S/calibration.json \
+                               --height-mm 1450          # optional, see below
 python calibrate.py sticker    --image $S/frame.png --calibration $S/calibration.json \
                                --height-mm 1450 --out $S/sticker.png
 python calibrate.py car        --image $S/frame.png --calibration $S/calibration.json \
@@ -67,6 +69,13 @@ Notes on the steps that have a trap in them:
   The calibration video must have the **same framing** as the station footage;
   the `gcp` step refuses to mix a 1080×1920 portrait calibration with a
   3840×2160 landscape frame, because scaling across aspect ratios is not valid.
+  `--model` picks the lens model and must match the lens: `pinhole` (default)
+  or `fisheye`. The pinhole model's two radial terms cannot represent a wide
+  fisheye — the fit converges, reports a plausible RMS on the views it was
+  given, and then bends straight lines near the frame edge. Every step and both
+  pipelines read the `model` field this writes and undistort accordingly, so
+  the choice made here follows the calibration everywhere. If straight edges
+  stay straight in the `frame` still, it is pinhole.
 - **`gcp`** — click a mark, type its world `X, Y` in millimetres. The world frame
   is yours; pick an origin and an axis on the tarmac and stay consistent. Four
   points is the minimum and is exactly determined — six or more spread across
@@ -76,6 +85,19 @@ Notes on the steps that have a trap in them:
   tape. The `gcp` residuals only say the fit agrees with itself at the marks it
   was given; this is the number a tape can argue with. Do it before trusting
   anything downstream.
+- **`carplane`** — *optional, and the one step that measures rather than assumes.*
+  Every other path to the marker's plane raises `Z` through the camera pose,
+  which is exact only if the pose is. This stands poles at marker height over
+  known ground marks and solves the plane from where their tops actually appear.
+  Click each pole top and type the world `X, Y` of **the mark beneath it** — the
+  displacement between the two is the parallax, and it is what the fit reads the
+  camera out of. Because the car plane is parallel to the ground at a known
+  height, it has three unknowns rather than a homography's eight, so two targets
+  already suffice and three make the residual a real check. The recovered camera
+  height is printed next to the pose's, an independent cross-check on both
+  surveys — a tape on the mast settles which is right when they disagree. Writes
+  a `car` block into `calibration.json`, in place; both pipelines then prefer it
+  for a marker at that height and fall back to raising `Z` at any other height.
 - **`sticker`** — click roughly where the marker is, then box it on the bird's-eye
   raster that appears. The box readout is in millimetres, so you can check it
   against the printed marker before committing. The step prints the
