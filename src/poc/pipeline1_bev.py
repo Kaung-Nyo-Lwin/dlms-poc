@@ -226,6 +226,92 @@ def car_box(body_template_mm, center_mm, template_heading_deg, yaw_offset_deg):
     return world, norm_deg(template_heading_deg + yaw_offset_deg)
 
 
+#: Short-side pixels below which the eight-parameter corner fit stops being
+#: trustworthy. Measured, not guessed: at 36 px a level marker read as 1.5 deg
+#: tilted, while at 63 px the same scene read within 0.2 deg and tracked a real
+#: tilt to better than 0.2 deg. Scale is what the fit is short of, so the number
+#: is in pixels and not millimetres.
+CORNER_PNP_MIN_PX = 60
+
+
+def marker_pose(K, R, t, corners_px, width_mm, height_mm):
+    """Marker -> world rotation and translation, from the four corners in pixels.
+
+    The planar read gives a centre and a heading, and takes the marker's height
+    on trust. Four corners over-determine that: solved as a pose they give the
+    tilt as well, which is the whole point — a braking car dips its roof while
+    its footprint stays put, and a rigid 2D transform charges the dip to the
+    car's position.
+
+    IPPE is used for the same reason the survey uses it, and with the same
+    caveat: a planar target has two poses that reproject almost equally well,
+    so both are asked for and the better one kept. On a marker this small the
+    two are far apart, and picking the wrong one is obvious rather than subtle.
+    """
+    obj = np.array([[-width_mm / 2, -height_mm / 2, 0.0],
+                    [width_mm / 2, -height_mm / 2, 0.0],
+                    [width_mm / 2, height_mm / 2, 0.0],
+                    [-width_mm / 2, height_mm / 2, 0.0]], dtype=np.float64)
+    img = np.asarray(corners_px, dtype=np.float64).reshape(-1, 1, 2)
+    zero = np.zeros(5)
+    try:
+        n, rvecs, tvecs, err = cv2.solvePnPGeneric(
+            obj.reshape(-1, 1, 3), img, K, zero, flags=cv2.SOLVEPNP_IPPE)
+    except cv2.error:
+        return None
+    if not n:
+        return None
+    best = int(np.argmin([float(np.ravel(e)[0]) for e in err]))
+    rvec, tvec = cv2.solvePnPRefineLM(obj.reshape(-1, 1, 3), img, K, zero,
+                                      rvecs[best], tvecs[best])
+    Rm, _ = cv2.Rodrigues(rvec)
+    # marker -> camera, then camera -> world through the station pose
+    return R.T @ Rm, R.T @ (tvec.ravel() - t)
+
+
+def car_box_from_tilt(body_template_mm, centre_mm, Rm, sticker_height_mm):
+    """Car footprint and template heading, in world millimetres.
+
+    Position comes from the planar read and orientation from the corner fit,
+    because each is the better measurement of its own quantity. Pinning the
+    marker to its surveyed height is strong information, and a pose solved from
+    four corners alone throws it away: tilt and depth trade off against each
+    other along the viewing ray, so the solved centre drifts by tens of
+    millimetres while the planar read holds a few. Measured here, the full pose
+    put the footprint out by 77 mm where the planar centre held 6 mm.
+
+    What the planar read cannot see is the tilt, and tilt is exactly what moves
+    the footprint out from under a marker no longer sitting square above it.
+    So the offset from marker to footprint — one sticker height down, in the
+    marker's own frame — is rotated by the measured attitude, and hung off the
+    planar centre.
+
+    With the marker level this reduces to :func:`car_box`, which is why the two
+    can be swapped by a flag with nothing else changing.
+    """
+    body = np.asarray(body_template_mm, dtype=np.float64)
+    pts = np.column_stack([body, np.full(len(body), -float(sticker_height_mm))])
+    xy = (pts @ np.asarray(Rm, dtype=np.float64).T)[:, :2] + np.asarray(centre_mm).reshape(2)
+    if len(xy) != 4:
+        xy = np.array(cv2.boxPoints(cv2.minAreaRect(xy.astype(np.float32))), dtype=np.float64)
+    fwd = np.asarray(Rm)[:, 0]                       # template +X, in world
+    return xy, math.degrees(math.atan2(fwd[1], fwd[0]))
+
+
+def pose_tilt_deg(Rm):
+    """Pitch and roll of the marker's plane, in degrees, for the record.
+
+    Zero means the marker is horizontal, which is what the planar read assumes
+    everywhere. These are written to the CSV so a run can be judged rather than
+    trusted: a car that never appears to tilt is a car whose corners are not
+    actually being fitted.
+    """
+    Rm = np.asarray(Rm, dtype=np.float64)
+    pitch = math.degrees(math.asin(float(np.clip(-Rm[2, 0], -1.0, 1.0))))
+    roll = math.degrees(math.asin(float(np.clip(Rm[2, 1], -1.0, 1.0))))
+    return pitch, roll
+
+
 def sticker_quad(centre_mm, heading_deg, width_mm, height_mm):
     """The matched template's own outline, in world millimetres.
 
@@ -389,8 +475,13 @@ class HybridDetector:
         hits.sort(reverse=True)
         return hits
 
-    def _ecc(self, frame, x, y, theta):
-        """Sub-pixel Euclidean refinement; this is where the millimetres are won."""
+    def _patch(self, frame, x, y, theta):
+        """De-rotated crop around a candidate, and the template padded to match.
+
+        Both refinements start here: the Euclidean one that places the marker
+        and the homography one that lets it tilt. Returning the affine ``M``
+        too is what lets a fitted corner be carried back to frame pixels.
+        """
         th, tw = self.tpl.shape[:2]
         # Keep the padded canvas the same parity as the template, or the template
         # lands half a pixel off centre and that becomes a fixed positional bias.
@@ -408,6 +499,15 @@ class HybridDetector:
         canvas[y0:y0 + th, x0:x0 + tw] = self.tpl
         m = np.zeros((ph, pw), np.uint8)
         m[y0:y0 + th, x0:x0 + tw] = 255
+        return patch, canvas, m, M, (ph, pw, th, tw, y0, x0), (c, s)
+
+    def _ecc(self, frame, x, y, theta):
+        """Sub-pixel Euclidean refinement; this is where the millimetres are won."""
+        got = self._patch(frame, x, y, theta)
+        if got is None:
+            return None
+        patch, canvas, m, _M, geom, (c, s) = got
+        ph, pw = geom[0], geom[1]
         try:
             cc, warp = cv2.findTransformECC(
                 canvas.astype(np.float32), patch.astype(np.float32),
@@ -422,6 +522,55 @@ class HybridDetector:
         total = prior @ np.linalg.inv(T) @ np.vstack([warp, [0, 0, 1.0]]) @ T
         return (float(cc), float(total[0, 2]), float(total[1, 2]),
                 norm_deg(math.degrees(math.atan2(-total[1, 0], total[0, 0]))))
+
+    def corner_quad(self, frame, x, y, theta):
+        """The marker's four corners in raster pixels, refit with tilt allowed.
+
+        ``detect`` fits three numbers — two of position and one of rotation —
+        which describes a marker lying flat at exactly the surveyed height. A
+        marker on a braking car does not lie flat: the roof dips, and its image
+        stops being a rectangle. Those three numbers cannot represent that, so
+        the dip is absorbed into position instead, which is precisely the error
+        a pose solve exists to remove.
+
+        Refitting the same patch with all eight parameters lets the corners
+        record the tilt. It is seeded from the Euclidean fit because ECC only
+        converges from a good start, and eight parameters from a cold start on
+        a small marker will wander.
+
+        Returns the corners in the template's own order — the one
+        :func:`sticker_quad` uses — or None if the fit does not converge.
+        """
+        got = self._patch(frame, x, y, theta)
+        if got is None:
+            return None
+        patch, canvas, m, M, geom, _cs = got
+        th, tw, y0, x0 = geom[2:]
+        try:
+            _cc, warp = cv2.findTransformECC(
+                canvas.astype(np.float32), patch.astype(np.float32),
+                np.eye(2, 3, dtype=np.float32), cv2.MOTION_EUCLIDEAN,
+                (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 200, 1e-7), m, 5)
+            seed = np.vstack([warp, [0, 0, 1]]).astype(np.float32)
+            cc, warp = cv2.findTransformECC(
+                canvas.astype(np.float32), patch.astype(np.float32),
+                seed, cv2.MOTION_HOMOGRAPHY,
+                (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 200, 1e-7), m, 5)
+        except cv2.error:
+            return None                      # ECC raises when it cannot converge
+        if not np.isfinite(warp).all():
+            return None
+
+        # Template corners in canvas pixels, ordered to match sticker_quad:
+        # the raster's Y runs opposite to the world's, so the template's first
+        # world corner (-w/2, -h/2) is its BOTTOM-left pixel, not its top-left.
+        corners = np.array([[x0, y0 + th - 1], [x0 + tw - 1, y0 + th - 1],
+                            [x0 + tw - 1, y0], [x0, y0]], dtype=np.float64)
+        # canvas -> patch (the fitted warp) -> frame (the crop's own affine)
+        q = np.column_stack([corners, np.ones(4)]) @ np.asarray(warp, dtype=np.float64).T
+        q = q[:, :2] / q[:, 2:]
+        out = np.column_stack([q, np.ones(4)]) @ M.T
+        return (out, float(cc)) if np.isfinite(out).all() else None
 
     def detect(self, bev, prior=None, search_px=None):
         """Returns (x, y, theta_deg, score, sigma_px, method) in raster pixels.
@@ -510,6 +659,9 @@ def main() -> None:
     ap.add_argument("--end", type=float, default=None)
     ap.add_argument("--min-score", type=float, default=0.45)
     ap.add_argument("--search-px", type=float, default=140.0, help="Local search radius once tracking.")
+    ap.add_argument("--corner-pnp", action="store_true",
+                    help="Solve the marker's tilt from its four corners instead of "
+                         "assuming it lies flat. Costs a second ECC fit per frame.")
     args = ap.parse_args()
 
     cal = load_calibration(args.calibration)
@@ -584,12 +736,21 @@ def main() -> None:
     print(f"  plane      {plane_note}", flush=True)
     print(f"  raster     {w_px}x{h_px} px @ {mmpp:g} mm/px, origin ({x_min:.0f}, {y_min:.0f}) mm", flush=True)
     print(f"  template   {template.shape[1]}x{template.shape[0]} px", flush=True)
+    if args.corner_pnp:
+        short = min(template.shape[:2])
+        print(f"  corner-pnp on, marker {short} px on its short side", flush=True)
+        if short < CORNER_PNP_MIN_PX:
+            print(f"  NOTE: under {CORNER_PNP_MIN_PX} px the corner fit is biased, not just "
+                  f"noisy — it read a level marker as tilted by more than a degree in "
+                  f"testing, which moves the footprint the wrong way. Either raise "
+                  f"--mm-per-px, or use a bigger marker, or leave --corner-pnp off.",
+                  flush=True)
     print(f"  rois       {', '.join(r['name'] for r in rois)}", flush=True)
 
     header = (["frame", "time_s", "found", "method", "score", "sigma_mm",
                "sticker_x_mm", "sticker_y_mm", "heading_deg"]
               + [f"box{i}_{ax}_mm" for i in range(1, 5) for ax in ("x", "y")]
-              + ["sticker_height_mm"]
+              + ["sticker_height_mm", "pitch_deg", "roll_deg", "plane_fit"]
               + [f"stick{i}_{ax}_mm" for i in range(1, 5) for ax in ("x", "y")]
               + [c for r in rois for c in (f"{r['name']}_mm", f"{r['name']}_hit")])
 
@@ -628,12 +789,36 @@ def main() -> None:
             # rather than trusting the angle's sign through the flip.
             tpl_heading = math.degrees(math.atan2(*(tip - centre)[::-1]))
             box, heading = car_box(car["body_mm"], centre, tpl_heading, car["yaw_offset_deg"])
+            quad = sticker_quad(centre, tpl_heading, tpl_w_mm, tpl_h_mm)
+            pitch = roll = None
+            fit = "planar"
+
+            # Same detection, read two ways. The planar answer above is kept as
+            # the fallback: the corner fit is the better model but the more
+            # fragile one, and a frame it cannot converge on should degrade to
+            # the old number rather than to no number at all.
+            if args.corner_pnp and cal["R"] is not None:
+                got_c = det.corner_quad(bev, x, y, theta)
+                if got_c is not None:
+                    quad_bev, _cc = got_c
+                    quad_px = apply_h(np.linalg.inv(Hpix2bev), quad_bev)
+                    pose = marker_pose(cal["K"], cal["R"], cal["t"], quad_px,
+                                       tpl_w_mm, tpl_h_mm)
+                    if pose is not None:
+                        Rm, _tm = pose
+                        box, tpl_h2 = car_box_from_tilt(
+                            car["body_mm"], centre, Rm, car["sticker_height_mm"])
+                        heading = norm_deg(tpl_h2 + car["yaw_offset_deg"])
+                        quad = apply_h(b2w, quad_bev)
+                        pitch, roll = pose_tilt_deg(Rm)
+                        fit = "corner-pnp"
 
             row = [idx, f"{t:.4f}", 1, method, f"{score:.4f}", f"{sigma_px * mmpp:.3f}",
                    f"{centre[0]:.1f}", f"{centre[1]:.1f}", f"{heading:.3f}"]
             row += [f"{v:.1f}" for corner in box for v in corner]
-            quad = sticker_quad(centre, tpl_heading, tpl_w_mm, tpl_h_mm)
-            row += [f"{car['sticker_height_mm']:.1f}"]
+            row += [f"{car['sticker_height_mm']:.1f}",
+                    "" if pitch is None else f"{pitch:.3f}",
+                    "" if roll is None else f"{roll:.3f}", fit]
             row += [f"{v:.1f}" for corner in quad for v in corner]
             for r in rois:
                 gap, hit = clearance_mm(box, r["world_mm"], r["closed"])

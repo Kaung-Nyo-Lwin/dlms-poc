@@ -405,7 +405,10 @@ def synthesise_raw_template(template, template_mm_per_px, plane: PlaneMap, ref_m
     # A match at theta=0 here means the metric template's +X lies along world +X,
     # so the constant is whatever world bearing image +X has at this pixel.
     yaw_offset = -plane.world_heading(ref_px, 0.0)
-    return crop, float(plane.mm_per_px(ref_px)), float(yaw_offset)
+    # The crop is the projected quad's bounding box, so the marker's own corners
+    # sit inside it at an angle. A corner fit needs to know where.
+    quad_in_crop = img_corners - [x0, y0]
+    return crop, float(plane.mm_per_px(ref_px)), float(yaw_offset), quad_in_crop
 
 
 def ecc_refine(pre, tpl, x, y, theta_deg):
@@ -448,6 +451,123 @@ def ecc_refine(pre, tpl, x, y, theta_deg):
             norm_deg(math.degrees(math.atan2(-total[1, 0], total[0, 0]))))
 
 
+#: Short-side pixels below which the eight-parameter corner fit stops being
+#: trustworthy. Measured, not guessed: at 36 px a level marker read as 1.5 deg
+#: tilted, while at 63 px the same scene read within 0.2 deg and tracked a real
+#: tilt to better than 0.2 deg.
+CORNER_PNP_MIN_PX = 60
+
+
+def ecc_corners(pre, tpl, quad_in_tpl, x, y, theta_deg):
+    """The marker's four corners in image pixels, refit with tilt allowed.
+
+    ``ecc_refine`` solves three numbers — two of position and one of rotation —
+    which describes a marker lying flat at exactly the surveyed height. A marker
+    on a braking car does not lie flat: the roof dips, and its image stops being
+    the shape the plane predicts. Three numbers cannot represent that, so the
+    dip is absorbed into position instead, which is the error a pose solve
+    exists to remove.
+
+    Seeded from the Euclidean fit, because ECC converges only from a good start
+    and eight parameters from cold on a small marker will wander.
+    """
+    th, tw = tpl.shape[:2]
+    ph, pw = int(th * 1.35) // 2 * 2 + th % 2, int(tw * 1.35) // 2 * 2 + tw % 2
+    a = math.radians(theta_deg)
+    c, s = math.cos(a), math.sin(a)
+    M = np.array([[c, s, x - (c * (pw / 2 - 0.5) + s * (ph / 2 - 0.5))],
+                  [-s, c, y - (-s * (pw / 2 - 0.5) + c * (ph / 2 - 0.5))]], dtype=np.float64)
+    patch = cv2.warpAffine(pre, M, (pw, ph),
+                           flags=cv2.INTER_CUBIC | cv2.WARP_INVERSE_MAP, borderValue=0)
+    if patch.size == 0 or float(patch.std()) < 1e-3:
+        return None
+    canvas = np.zeros((ph, pw), tpl.dtype)
+    y0, x0 = (ph - th) // 2, (pw - tw) // 2
+    canvas[y0:y0 + th, x0:x0 + tw] = tpl
+    mask = np.zeros((ph, pw), np.uint8)
+    mask[y0:y0 + th, x0:x0 + tw] = 255
+    try:
+        _cc, warp = cv2.findTransformECC(
+            canvas.astype(np.float32), patch.astype(np.float32),
+            np.eye(2, 3, dtype=np.float32), cv2.MOTION_EUCLIDEAN,
+            (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 200, 1e-7), mask, 5)
+        seed = np.vstack([warp, [0, 0, 1]]).astype(np.float32)
+        cc, warp = cv2.findTransformECC(
+            canvas.astype(np.float32), patch.astype(np.float32),
+            seed, cv2.MOTION_HOMOGRAPHY,
+            (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 200, 1e-7), mask, 5)
+    except cv2.error:
+        return None                        # ECC raises when it cannot converge
+    if not np.isfinite(warp).all():
+        return None
+    # The crop holds the projected quad at an angle inside its bounding box, so
+    # the corners come from where it was drawn, not from the crop's own edges.
+    corners = np.asarray(quad_in_tpl, dtype=np.float64) + np.array([x0, y0], dtype=np.float64)
+    q = np.column_stack([corners, np.ones(len(corners))]) @ np.asarray(warp, dtype=np.float64).T
+    q = q[:, :2] / q[:, 2:]
+    out = np.column_stack([q, np.ones(len(q))]) @ M.T
+    # synthesise_raw_template lists corners +X right, +Y down, i.e. world -Y;
+    # marker_pose wants them from (-w/2, -h/2) round. That is the reverse order.
+    return (out[::-1], float(cc)) if np.isfinite(out).all() else None
+
+
+def marker_pose(K, R, t, corners_px, width_mm, height_mm):
+    """Marker -> world rotation and translation, from the four corners in pixels.
+
+    IPPE is used for the same reason the survey uses it, and with the same
+    caveat: a planar target has two poses that reproject almost equally well,
+    so both are asked for and the better one kept.
+    """
+    obj = np.array([[-width_mm / 2, -height_mm / 2, 0.0],
+                    [width_mm / 2, -height_mm / 2, 0.0],
+                    [width_mm / 2, height_mm / 2, 0.0],
+                    [-width_mm / 2, height_mm / 2, 0.0]], dtype=np.float64)
+    img = np.asarray(corners_px, dtype=np.float64).reshape(-1, 1, 2)
+    zero = np.zeros(5)
+    try:
+        n, rvecs, tvecs, err = cv2.solvePnPGeneric(
+            obj.reshape(-1, 1, 3), img, K, zero, flags=cv2.SOLVEPNP_IPPE)
+    except cv2.error:
+        return None
+    if not n:
+        return None
+    best = int(np.argmin([float(np.ravel(e)[0]) for e in err]))
+    rvec, tvec = cv2.solvePnPRefineLM(obj.reshape(-1, 1, 3), img, K, zero,
+                                      rvecs[best], tvecs[best])
+    Rm, _ = cv2.Rodrigues(rvec)
+    return R.T @ Rm, R.T @ (tvec.ravel() - t)
+
+
+def car_box_from_tilt(body_template_mm, centre_mm, Rm, sticker_height_mm):
+    """Car footprint and template heading, in world millimetres.
+
+    Position comes from the planar read and orientation from the corner fit,
+    because each is the better measurement of its own quantity. Pinning the
+    marker to its surveyed height is strong information, and a pose solved from
+    four corners alone throws it away: tilt and depth trade off along the
+    viewing ray, so the solved centre drifts by tens of millimetres while the
+    planar read holds a few. Measured here, the full pose put the footprint out
+    by 77 mm where the planar centre held 6 mm.
+
+    What the planar read cannot see is the tilt, and tilt is what moves the
+    footprint out from under a marker no longer sitting square above it.
+    """
+    body = np.asarray(body_template_mm, dtype=np.float64)
+    pts = np.column_stack([body, np.full(len(body), -float(sticker_height_mm))])
+    xy = (pts @ np.asarray(Rm, dtype=np.float64).T)[:, :2] + np.asarray(centre_mm).reshape(2)
+    if len(xy) != 4:
+        xy = np.array(cv2.boxPoints(cv2.minAreaRect(xy.astype(np.float32))), dtype=np.float64)
+    fwd = np.asarray(Rm)[:, 0]
+    return xy, math.degrees(math.atan2(fwd[1], fwd[0]))
+
+
+def pose_tilt_deg(Rm):
+    """Pitch and roll of the marker's plane, in degrees, for the record."""
+    Rm = np.asarray(Rm, dtype=np.float64)
+    return (math.degrees(math.asin(float(np.clip(-Rm[2, 0], -1.0, 1.0)))),
+            math.degrees(math.asin(float(np.clip(Rm[2, 1], -1.0, 1.0)))))
+
+
 def polish_where_it_is(pre, plane, template, template_mm_per_px, x, y, theta_deg):
     """Re-cut the crop at the position just found, then refine once more.
 
@@ -463,7 +583,8 @@ def polish_where_it_is(pre, plane, template, template_mm_per_px, x, y, theta_deg
     """
     centre_mm = plane.to_world(np.array([[x, y]]))[0]
     try:
-        crop, _, yaw = synthesise_raw_template(template, template_mm_per_px, plane, centre_mm)
+        crop, _, yaw, _quad = synthesise_raw_template(
+            template, template_mm_per_px, plane, centre_mm)
     except SystemExit:
         return None                        # marker projects off-frame here
     got = ecc_refine(pre, preprocess(crop), x, y, theta_deg)
@@ -650,6 +771,9 @@ def main() -> None:
     ap.add_argument("--end", type=float, default=None)
     ap.add_argument("--min-score", type=float, default=0.40)
     ap.add_argument("--search-px", type=float, default=120.0)
+    ap.add_argument("--corner-pnp", action="store_true",
+                    help="Solve the marker's tilt from its four corners instead of "
+                         "assuming it lies flat. Costs a second ECC fit per frame.")
     args = ap.parse_args()
 
     cal = load_calibration(args.calibration)
@@ -682,6 +806,11 @@ def main() -> None:
             "only be read on the ground — which misplaces a roof marker by metres."
         )
     plane = PlaneMap(H_car)
+    if args.corner_pnp and cal["R"] is None:
+        raise SystemExit(
+            "--corner-pnp needs the camera pose to turn corners into a marker attitude; "
+            "this calibration has none. Re-run the `gcp` survey step."
+        )
 
     # Search region: the ROI world extent plus a margin, projected onto the car
     # plane and clipped to the frame. Anything past the plane's horizon is
@@ -721,7 +850,7 @@ def main() -> None:
     # the synthesised crop, whose pixel size is whatever the camera sees there.
     tpl_w_mm = template.shape[1] * args.template_mm_per_px
     tpl_h_mm = template.shape[0] * args.template_mm_per_px
-    crop, ref_mm_per_px, yaw_ref = synthesise_raw_template(
+    crop, ref_mm_per_px, yaw_ref, _quad_ref = synthesise_raw_template(
         template, args.template_mm_per_px, plane, ref)
 
     # Scale bands: what the plane predicts the crop needs across the region.
@@ -780,7 +909,7 @@ def main() -> None:
     header = (["frame", "time_s", "found", "method", "score", "sigma_mm",
                "sticker_x_mm", "sticker_y_mm", "heading_deg"]
               + [f"box{i}_{ax}_mm" for i in range(1, 5) for ax in ("x", "y")]
-              + ["sticker_height_mm"]
+              + ["sticker_height_mm", "pitch_deg", "roll_deg", "plane_fit"]
               + [f"stick{i}_{ax}_mm" for i in range(1, 5) for ax in ("x", "y")]
               + [c for r in rois for c in (f"{r['name']}_mm", f"{r['name']}_hit")]
               + ["scale", "expected_scale", "scale_ratio"])
@@ -826,14 +955,41 @@ def main() -> None:
             hits += 1
             centre = plane.to_world(centre_px[None, :])[0]
             box, heading = car_box(car["body_mm"], centre, tpl_heading, car["yaw_offset_deg"])
+            quad = sticker_quad(centre, tpl_heading, tpl_w_mm, tpl_h_mm)
             local_mm_px = plane.mm_per_px(centre_px)
             expected = ref_mm_per_px / max(local_mm_px, 1e-9)
+            pitch = roll = None
+            fit = "planar"
+
+            # Same detection, read two ways. The planar answer above is kept as
+            # the fallback: the corner fit is the better model but the more
+            # fragile one, and a frame it cannot converge on should degrade to
+            # the old number rather than to no number at all.
+            if args.corner_pnp and cal["R"] is not None:
+                try:
+                    crop_c, _mm, _yaw, quad_c = synthesise_raw_template(
+                        template, args.template_mm_per_px, plane, centre)
+                except SystemExit:
+                    crop_c = None
+                if crop_c is not None:
+                    got_c = ecc_corners(pre, preprocess(crop_c), quad_c, x, y, theta)
+                    if got_c is not None:
+                        pose = marker_pose(cal["K"], cal["R"], cal["t"], got_c[0],
+                                           tpl_w_mm, tpl_h_mm)
+                        if pose is not None:
+                            Rm, _tm = pose
+                            box, tpl_h2 = car_box_from_tilt(
+                                car["body_mm"], centre, Rm, car["sticker_height_mm"])
+                            heading = norm_deg(tpl_h2 + car["yaw_offset_deg"])
+                            pitch, roll = pose_tilt_deg(Rm)
+                            fit = "corner-pnp"
 
             row = [idx, f"{t:.4f}", 1, method, f"{score:.4f}", f"{sigma_px * local_mm_px:.3f}",
                    f"{centre[0]:.1f}", f"{centre[1]:.1f}", f"{heading:.3f}"]
             row += [f"{v:.1f}" for corner in box for v in corner]
-            quad = sticker_quad(centre, tpl_heading, tpl_w_mm, tpl_h_mm)
-            row += [f"{car['sticker_height_mm']:.1f}"]
+            row += [f"{car['sticker_height_mm']:.1f}",
+                    "" if pitch is None else f"{pitch:.3f}",
+                    "" if roll is None else f"{roll:.3f}", fit]
             row += [f"{v:.1f}" for corner in quad for v in corner]
             for r in rois:
                 gap, hit = clearance_mm(box, r["world_mm"], r["closed"])

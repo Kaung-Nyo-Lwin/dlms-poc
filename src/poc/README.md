@@ -189,6 +189,49 @@ Get it wrong and a pixel-perfect detection draws the box at right angles across
 the car, which nothing downstream can catch. The `car` step derives it from a
 click so it cannot be got backwards.
 
+**A flat marker is an assumption, and `--corner-pnp` is how you drop it.** The
+detector fits three numbers — two of position and one of rotation — which
+describes a marker lying flat at exactly `sticker_height_mm`. A braking car
+dips its roof: the marker tilts and shifts while the footprint stays put, and
+three numbers cannot represent that, so the whole dip is charged to the car's
+position. It is a bias, not noise, so averaging frames will not remove it.
+
+`--corner-pnp` refits the same patch with all eight parameters, takes the four
+corners that fit implies, and solves them as a marker pose. What it uses from
+that pose is **only the attitude**. Position still comes from the planar read,
+because the two measure different things well: pinning the marker to its
+surveyed height is strong information, and a pose solved from four corners
+alone throws it away — tilt and depth trade off along the viewing ray, so the
+solved centre drifts by tens of millimetres where the planar read holds a few.
+Measured on a synthetic B7 scene, the full pose put the footprint out by 77 mm
+where the planar centre held 6 mm. So the offset from marker to footprint is
+rotated by the measured attitude and hung off the planar centre.
+
+Mean footprint-corner error, pipeline 1, synthetic B7 geometry, car pitching
+about its contact patches with roll at half the pitch:
+
+| pitch | default | `--corner-pnp` |
+|---|---|---|
+| 0° | 6.5 mm | 4.5 mm |
+| 1° | 28.1 mm | 4.5 mm |
+| 2° | 60.4 mm | 4.4 mm |
+| 3° | 92.9 mm | 4.6 mm |
+
+**It needs a marker at least ~60 px on its short side** — 700 mm at B7's
+11 mm/px. Below that the eight-parameter fit is biased rather than merely
+noisy: at 36 px a level marker read as 1.5° tilted, which moves the footprint
+the wrong way and made `--corner-pnp` *worse* than leaving it off. Both
+pipelines print the marker's pixel size and warn when it is under the limit.
+Frames where the fit does not converge fall back to the planar read, and the
+`plane_fit` column records which was used per frame, alongside `pitch_deg` and
+`roll_deg`.
+
+Pipeline 1's numbers above are measured. Pipeline 2 carries the same code path
+but is **not yet validated the same way** — the synthetic harness for it is not
+trustworthy, and separately `polish_where_it_is` rejects its re-cut at larger
+tilts, because a crop synthesised on the flat plane stops matching a marker
+that is not on it. Treat `--corner-pnp` on pipeline 2 as untested.
+
 ## Accuracy
 
 Measured on `raw/B7/B7_park.mp4` (3840×2160), 41 frames, against the same frame
