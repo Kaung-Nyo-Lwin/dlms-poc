@@ -31,6 +31,7 @@ CENTRE = (0, 0, 255)
 HEADING = (247, 120, 186)
 ROI_OK = (255, 190, 60)
 ROI_HIT = (60, 60, 235)
+WHEEL = (0, 165, 255)
 TEXT = (255, 255, 255)
 FONT = cv2.FONT_HERSHEY_SIMPLEX
 
@@ -66,9 +67,29 @@ def undistort_points(pts, K, D, model):
     return cv2.undistortPoints(p, K, D, P=K).reshape(-1, 2)
 
 
+def camera_from_pose(R, t):
+    """Camera centre in world millimetres, and which way is up.
+
+    The world frame is whatever the operator laid out on the tarmac, and nothing
+    forces it to be right-handed: point +X along the kerb and +Y across it the
+    other way, and +Z runs into the ground instead of out of it. Every 2D
+    quantity survives that — the ground homography is a map, and a map does not
+    care — so the survey checks out, the residuals are millimetres, and nothing
+    complains. The mistake only surfaces when something is rectified to a height
+    *above* the ground, because every such plane is then built on the wrong side
+    of the tarmac and parallax runs backwards.
+
+    So up is taken from the camera, which is unarguably above the ground, rather
+    than from the frame's own +Z.
+    """
+    centre = -np.asarray(R, dtype=np.float64).T @ np.asarray(t, dtype=np.float64)
+    return centre, (1.0 if centre[2] >= 0 else -1.0)
+
+
 def homography_at_height(K, R, t, height_mm: float):
     """Image -> world (X, Y) for the horizontal plane Z = height_mm."""
-    Hw2i = K @ np.column_stack([R[:, 0], R[:, 1], R[:, 2] * float(height_mm) + t])
+    _, up = camera_from_pose(R, t)
+    Hw2i = K @ np.column_stack([R[:, 0], R[:, 1], R[:, 2] * (up * float(height_mm)) + t])
     H = np.linalg.inv(Hw2i)
     return H / H[2, 2]
 
@@ -106,6 +127,26 @@ def apply_h(H, pts):
     return q[:, :2] / w
 
 
+def parse_time(text):
+    """Seconds from "130", "2:10" or "1:02:03". None passes through.
+
+    Colons because that is how anyone reads a time off a player's scrubber, and
+    a render is nearly always cut to something that was watched first.
+    """
+    if text is None:
+        return None
+    parts = str(text).strip().split(":")
+    if len(parts) > 3:
+        raise SystemExit(f"cannot read {text!r} as a time; use s, m:ss or h:mm:ss")
+    total = 0.0
+    try:
+        for part in parts:
+            total = total * 60.0 + float(part)
+    except ValueError:
+        raise SystemExit(f"cannot read {text!r} as a time; use s, m:ss or h:mm:ss") from None
+    return total
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--video", required=True, type=Path)
@@ -114,6 +155,11 @@ def main() -> None:
     ap.add_argument("--rois", required=True, type=Path)
     ap.add_argument("--out", required=True, type=Path)
     ap.add_argument("--roi-distorted", action="store_true")
+    ap.add_argument("--start", default=None,
+                    help="Render from this point on: seconds, or m:ss, or h:mm:ss.")
+    ap.add_argument("--end", default=None, help="Render up to this point. Same formats.")
+    ap.add_argument("--tyre-width-mm", type=float, default=None,
+                    help="Draw each wheel as a tyre-sized footprint rather than a cross.")
     ap.add_argument("--units", default="m", choices=("m", "cm", "mm"))
     ap.add_argument("--scale", type=float, default=0.5, help="Output size relative to the source.")
     ap.add_argument("--label-scale", type=float, default=1.0,
@@ -139,6 +185,7 @@ def main() -> None:
         columns = list(reader.fieldnames or [])
         for row in reader:
             rows[int(row["frame"])] = row
+    wheels_in_csv = all(f"wheel_{w}_x_mm" in columns for w in ("fl", "fr", "rl", "rr"))
 
     # The CSV and the ROI file are two separate paths, and nothing links them.
     # Rendering a track against a different ROI set than it was measured with
@@ -199,12 +246,41 @@ def main() -> None:
     args.out.parent.mkdir(parents=True, exist_ok=True)
     writer = cv2.VideoWriter(str(args.out), cv2.VideoWriter_fourcc(*"mp4v"), fps, out_size)
 
-    idx, written = -1, 0
+    t0, t1 = parse_time(args.start), parse_time(args.end)
+    if t0 is not None and t1 is not None and t1 <= t0:
+        raise SystemExit(f"--end {args.end} is not after --start {args.start}")
+    first = 0 if t0 is None else int(t0 * fps)
+    last = None if t1 is None else int(t1 * fps)
+    if first:
+        # Seek rather than decode up to the window. The index is then read back
+        # from the capture instead of counted from zero, so a backend that lands
+        # somewhere other than where it was asked still keeps the rows lined up
+        # with the pictures — and one that cannot seek at all just starts at the
+        # beginning and is slow, rather than silently drawing the wrong frames.
+        cap.set(cv2.CAP_PROP_POS_FRAMES, first)
+    idx = int(cap.get(cv2.CAP_PROP_POS_FRAMES)) - 1
+    if t0 is not None or t1 is not None:
+        span = [r for r in rows.values()
+                if (t0 is None or float(r["time_s"]) >= t0)
+                and (t1 is None or float(r["time_s"]) <= t1)]
+        print(f"  window     {t0 if t0 is not None else 0:.2f}s to "
+              f"{'end' if t1 is None else f'{t1:.2f}s'} — frames {first}"
+              f"{'' if last is None else f'..{last}'}, {len(span)} row(s) in it")
+        if not span:
+            raise SystemExit(
+                f"no rows in that window; {args.csv} covers "
+                f"{min(float(r['time_s']) for r in rows.values()):.2f}s to "
+                f"{max(float(r['time_s']) for r in rows.values()):.2f}s"
+            )
+
+    written = 0
     while True:
         ok, frame = cap.read()
         if not ok:
             break
         idx += 1
+        if last is not None and idx > last:
+            break
         row = rows.get(idx)
         if row is None:
             continue
@@ -238,7 +314,33 @@ def main() -> None:
             if np.isfinite(box).all():
                 b = box.astype(np.int32)
                 cv2.polylines(img, [b], True, BOX, lw, cv2.LINE_AA)
+                # thicker along the front edge, so which way the car faces is
+                # readable without following the heading arrow
                 cv2.line(img, tuple(b[0]), tuple(b[1]), BOX, round(lw * 2.2), cv2.LINE_AA)
+
+            # Contact patches, drawn through the GROUND homography like the box —
+            # the tyre meets the road at z = 0, so this is the one place in the
+            # frame where the car and the paint are genuinely on the same plane.
+            # Each is a tyre-sized footprint rather than a dot, because the rules
+            # ask whether a tyre is on a line, not whether a point is.
+            if wheels_in_csv and row.get("wheel_fl_x_mm"):
+                w_mm = np.array([[float(row[f"wheel_{w}_x_mm"]),
+                                  float(row[f"wheel_{w}_y_mm"])]
+                                 for w in ("fl", "fr", "rl", "rr")])
+                wp = apply_h(world_to_px, w_mm)
+                if np.isfinite(wp).all():
+                    if args.tyre_width_mm:
+                        # Radius in pixels from the local ground sample distance,
+                        # so the mark shrinks with distance the way the car does.
+                        off = np.array([args.tyre_width_mm / 2, 0.0])
+                        for centre_px, corner in zip(wp, w_mm, strict=True):
+                            edge = apply_h(world_to_px, (corner + off)[None, :])[0]
+                            r = round(float(np.linalg.norm(edge - centre_px)))
+                            cv2.circle(img, tuple(centre_px.astype(np.int32)),
+                                       max(3, r), WHEEL, lw, cv2.LINE_AA)
+                    for q in wp.astype(np.int32):
+                        cv2.drawMarker(img, tuple(q), WHEEL, cv2.MARKER_CROSS,
+                                       round(20 * k), lw)
             h = float(row.get("sticker_height_mm") or 0.0)
             if h in sticker_px and row.get("stick1_x_mm"):
                 quad_mm = np.array([[float(row[f"stick{i}_x_mm"]), float(row[f"stick{i}_y_mm"])]

@@ -29,14 +29,16 @@ python calibrate.py intrinsics --video $S/checkerboard.mp4 --board 11x7 --square
 python calibrate.py gcp        --image $S/frame.png --intrinsics $S/intrinsics.json \
                                --out $S/calibration.json
 python calibrate.py measure    --image $S/frame.png --calibration $S/calibration.json
+python calibrate.py tape       --image $S/frame.png --calibration $S/calibration.json
 python calibrate.py carplane   --image $S/frame.png --calibration $S/calibration.json \
                                --height-mm 1450          # optional, see below
 python calibrate.py sticker    --image $S/frame.png --calibration $S/calibration.json \
                                --height-mm 1450 --out $S/sticker.png
-python calibrate.py car        --image $S/frame.png --calibration $S/calibration.json \
-                               --sticker-height-mm 1450 --length-mm 4700 --width-mm 1800 \
-                               --sticker-to-front-mm 2000 --wheelbase-mm 2750 \
-                               --track-mm 1550 --out $S/car.json
+python calibrate.py outline    --image $S/frame.png --calibration $S/calibration.json \
+                               --sticker-height-mm 1450 --height-mm 500 \
+                               --length-mm 4700 --width-mm 1800 \
+                               --front-to-wheel-mm 900 --rear-to-wheel-mm 850 \
+                               --out $S/car.json
 python calibrate.py roi        --image $S/frame.png --calibration $S/calibration.json \
                                --out $S/rois.json
 ```
@@ -51,7 +53,8 @@ repeatable between operators.
 
 There are no pop-up dialogs anywhere. Text goes in one field in the toolbar,
 read only at the moment it is needed: in `roi` it is the optional name for the
-next shape, in `gcp` it is the world `X, Y` you type *before* clicking the mark.
+next shape, in `gcp` it is the world `X, Y` you type *before* clicking the mark,
+in `tape` it is the length in millimetres you type before clicking both ends.
 A dialog can be blocked outright in an embedded browser such as VS Code's
 Simple Browser, and even when it renders it may never take keyboard focus — so
 nothing here is allowed to block on one. Finishing a shape with **p** / **l** /
@@ -85,6 +88,63 @@ Notes on the steps that have a trap in them:
   tape. The `gcp` residuals only say the fit agrees with itself at the marks it
   was given; this is the number a tape can argue with. Do it before trusting
   anything downstream.
+- **`tape`** — *the second opinion on scale, from lengths you never surveyed.*
+  Lay a tape between two marks on the tarmac, read the millimetres, click both
+  ends. Neither end needs a world coordinate, which is what makes these cheap
+  enough to lay several of, out where the four ground control points are not.
+  Be blunt about what it can see: with correct GCP coordinates, four points
+  against a six-parameter pose is already over-determined and
+  `solvePnPRefineLM` has the click noise handled — 2 mm rms on synthetic
+  station geometry, where *every* tape-based adjustment made it worse. **A tape
+  is not a fix for a noisy pose.** It is the only fix for a wrong *survey*:
+  coordinates typed off a stretched tape, a mis-paced offset, a transposed
+  digit. Nothing in the image can see that, because the fit is perfectly
+  self-consistent with the wrong answer — `gcp` reports millimetres of residual
+  while the map is centimetres out.
+  So the step **reports and changes nothing** unless you pass `--adjust`, and
+  what it does then depends on whether the tapes agree with each other. If they
+  do, the fault is scale, and it is corrected in closed form as `t -> a*t` —
+  scaling the translation multiplies every ground coordinate by exactly `a` and
+  touches nothing else, so the typed coordinates are scaled to match. If they
+  disagree, the fault has shape, and the pose and *all* the typed coordinates
+  are re-solved together against the tapes. That second part is the whole
+  design: hold the typed coordinates as truth and their reprojection residuals
+  pin the pose completely, so the tapes have nowhere to push and the fit comes
+  back unchanged — a pose-only refinement carrying a tape measured identical to
+  plain `solvePnP` in every error mode tried. `--sigma-world-mm` is therefore
+  the real knob: it is how far the tapes may overrule the survey.
+  Ground-distance rms over an 8x20 m working area, synthetic station geometry:
+
+  | GCP coordinates | 4-pt PnP | rescale | free net, 1 / 2 / 3 tapes |
+  |---|---|---|---|
+  | exact | **2 mm** | 14 mm | 14 / 10 / 8 mm |
+  | 0.5% scale error | 50 mm | **14 mm** | 37 / 30 / 31 mm |
+  | 30 mm random | 100 mm | 75 mm | 59 / 46 / **26 mm** |
+
+  Read the first row before reaching for `--adjust`: when the survey is already
+  right, adjusting costs a factor of seven, which is why the gate refuses when
+  no tape is more than `--gate-z` sigma out. Read the last: three tapes is
+  where the free network starts winning consistently. **Lay them long** — a
+  tape's noise divides by its length, so one 10 m tape is worth nine 3 m ones,
+  and length is free where a fourth tape is not.
+  Two refusals guard it, and neither is "the correction was large": a survey
+  wrong by 30 mm at the marks is legitimately hundreds of millimetres wrong out
+  where nothing was surveyed, so capping the movement would reject exactly the
+  corrections worth making. What a blunder looks like is a tape still not
+  fitting once the fit has had every chance (`--max-bar-z`), or a mark dragged
+  further than a survey could plausibly be wrong (`--max-gcp-move-sigma`). A
+  transposed digit in a length, a click on the wrong mark, and a mistyped
+  ground control coordinate are each caught and named.
+  Adjusting rewrites the pose, so it re-fits the surveyed `car` plane from its
+  stored pole tops — leaving that stale is the one outcome that must not
+  happen, since both pipelines prefer it and nothing downstream can tell it
+  disagrees with the ground beneath it. **`car.json` is stale too** and the step
+  says so: its `body_polygon_mm` came from clicks through the old plane. Re-run
+  `outline`.
+  A tape cannot tell "the pose is wrong" from "the ground is not flat here". On
+  a sloped pad one laid across the fall reads long, and `--adjust` will bend the
+  pose to absorb a non-planarity no pose can represent. That is the argument for
+  leaving the check as the default.
 - **`carplane`** — *optional, and the one step that measures rather than assumes.*
   Every other path to the marker's plane raises `Z` through the camera pose,
   which is exact only if the pose is. This stands poles at marker height over
@@ -98,6 +158,71 @@ Notes on the steps that have a trap in them:
   surveys — a tape on the mast settles which is right when they disagree. Writes
   a `car` block into `calibration.json`, in place; both pipelines then prefer it
   for a marker at that height and fall back to raising `Z` at any other height.
+- **`outline`** — *the car's box, traced instead of taped.* Four clicks going
+  round the car — front-left, front-right, rear-right, rear-left — on a
+  bird's-eye raster, stored as millimetre offsets from the marker. Replaces
+  `car`'s five tape numbers and its nose click; the click order is what fixes
+  which end is the front.
+  **When the far end is hidden** — which it usually is, since an oblique camera
+  sees the near end down to the road but the car's own body covers the rest —
+  pass `--length-mm` and click only the two front corners. The rear is built
+  square to the front edge at that distance, in world millimetres, so it never
+  touches an image and no plane can be wrong back there. Which way is backwards
+  comes from the marker, not from a click: it sits inside the footprint, so the
+  rearward perpendicular is whichever points towards it.
+  **`--side` adds a second pass**: two more clicks, down one flank. The front
+  edge is only a car's width long, and a direction taken from it swings the far
+  corners sideways in proportion to their distance along the car — which is why
+  a survey comes back with good front-to-back numbers and bad left-to-right ones
+  from the same clicks. A flank line is four times the baseline, and it pins
+  something the front edge cannot: **where the side of the car actually is**, so
+  the box stops having to assume the marker sits on the centreline. A marker
+  stuck 60 mm off centre otherwise throws every lateral measurement by 60 mm
+  with nothing in the file to show it. Measured on a synthetic B7 car with the
+  marker 300 mm off centre: 300 mm of corner error without `--side`, **0 mm with
+  it**; with a 40 mm click slip on top, 379 mm against 20 mm. Each click then
+  does what it is good at — direction and lateral position from the long flank,
+  how far forward from the square, hard bumper edge — and the two lines can
+  finally check each other, in millimetres at a corner rather than in degrees.
+  Pass `--width-mm` too
+  — it lays a span of exactly that width half either side of **the marker**
+  rather than either side of the clicked midpoint, since the car is symmetric
+  about the centreline the marker sits on. A corner clicked wide then costs the
+  edge's direction only instead of dragging the whole car sideways by half the
+  error; a corner slid 300 mm along the edge leaves the footprint exact. It is
+  also compared against the clicked width. That comparison is the **only** check that can see a wrong `--height-mm`
+  in this mode, because a built box is square and the right length whatever
+  plane it was traced on. The step reports the disagreement as the box error it
+  implies (`error = gap * r / width`) rather than as millimetres of width, and
+  solves back for the height the clicks actually imply — an 88 mm width gap is
+  300 mm of box, which is why a raw width threshold is the wrong unit.
+  Nothing is written until you approve it: the step shows the adjusted line and
+  the resulting box as two toggleable overlays with the raw clicks marked, and
+  cancelling that view re-runs the clicks. `--no-preview` skips the check. **`--height-mm` is the number that matters**: a
+  raster rectified to height `p` shows where things *appear* on that plane, so
+  a corner at height `h` traced on the wrong one comes back displaced by about
+  `|h - p| * r / (H_camera - h)` — roughly a millimetre per millimetre of
+  mismatch at B7. Bumper corners sit near 500 mm; tracing them on the marker's
+  1450 mm plane returns a 3345 x 1422 mm box for a 4000 x 1700 mm car and a
+  footprint 964 mm out. Moving the plane costs nothing in visibility: both
+  rasters resample the same undistorted pixels, only the millimetres assigned
+  to a click change. The error is a constant in the car's frame, so it rotates
+  with the car and tracks it perfectly — it never announces itself, and the
+  squareness check cannot see it. **Compare the printed box against the car's
+  real length and width; that is the only place a wrong height shows up.**
+  **Wheels** come from `--wheelbase-mm`, `--track-mm` and `--front-overhang-mm`,
+  all three or none. They are not clicked: an oblique camera shows the near
+  side behind the sill and the far side under the body, so the contact patches
+  are constructed off the box's own axes instead. That also retires the `car`
+  step's guess that the two overhangs are equal — a front-drive hatchback's
+  front overhang runs 100-150 mm longer, which put each axle 50-75 mm out.
+  `--check-wheels` opens a **ground-plane** raster to click whatever patches
+  are visible and reports how far each is from the constructed one; that is the
+  only independent word on whether the three tape numbers are right.
+  `--tyre-width-mm` lets a rule ask whether a *tyre* is on a line rather than
+  whether its centre point is. Without wheels, ten of the DSR's rules score as
+  not-evaluated.
+- **`car`** — the older tape-measured route to the same file. Prefer `outline`.
 - **`sticker`** — click roughly where the marker is, then box it on the bird's-eye
   raster that appears. The box readout is in millimetres, so you can check it
   against the printed marker before committing. The step prints the

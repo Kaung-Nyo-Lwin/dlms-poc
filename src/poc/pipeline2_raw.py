@@ -76,9 +76,29 @@ def load_calibration(path: Path) -> dict:
     }
 
 
+def camera_from_pose(R, t):
+    """Camera centre in world millimetres, and which way is up.
+
+    The world frame is whatever the operator laid out on the tarmac, and nothing
+    forces it to be right-handed: point +X along the kerb and +Y across it the
+    other way, and +Z runs into the ground instead of out of it. Every 2D
+    quantity survives that — the ground homography is a map, and a map does not
+    care — so the survey checks out, the residuals are millimetres, and nothing
+    complains. The mistake only surfaces when something is rectified to a height
+    *above* the ground, because every such plane is then built on the wrong side
+    of the tarmac and parallax runs backwards.
+
+    So up is taken from the camera, which is unarguably above the ground, rather
+    than from the frame's own +Z.
+    """
+    centre = -np.asarray(R, dtype=np.float64).T @ np.asarray(t, dtype=np.float64)
+    return centre, (1.0 if centre[2] >= 0 else -1.0)
+
+
 def homography_at_height(K: np.ndarray, R: np.ndarray, t: np.ndarray, height_mm: float):
     """Image -> world (X, Y) for the horizontal plane Z = height_mm."""
-    Hw2i = K @ np.column_stack([R[:, 0], R[:, 1], R[:, 2] * float(height_mm) + t])
+    _, up = camera_from_pose(R, t)
+    Hw2i = K @ np.column_stack([R[:, 0], R[:, 1], R[:, 2] * (up * float(height_mm)) + t])
     H = np.linalg.inv(Hw2i)
     return H / H[2, 2]
 
@@ -106,11 +126,20 @@ def load_car(path: Path) -> dict:
         a = math.radians(yaw)
         c, s = math.cos(a), math.sin(a)
         body = car @ np.array([[c, -s], [s, c]]).T
+    wheels = raw.get("wheels_mm") or None
+    if wheels:
+        wheels = {k: np.array([v["x_mm"], v["y_mm"]], dtype=np.float64)
+                  for k, v in wheels.items()}
     return {
         "car_id": str(raw.get("car_id", "car")),
         "body_mm": body,
         "yaw_offset_deg": yaw,
         "sticker_height_mm": float(raw["sticker_height_mm"]),
+        # Contact patches, in the same template frame as the body and moved by
+        # the same rigid transform. Absent when the survey did not measure them,
+        # and every wheel rule then scores as not-evaluated rather than as passed.
+        "wheels_mm": wheels,
+        "tyre_width_mm": raw.get("tyre_width_mm"),
     }
 
 
@@ -274,6 +303,26 @@ def car_box(body_template_mm, center_mm, template_heading_deg, yaw_offset_deg):
     return world, norm_deg(template_heading_deg + yaw_offset_deg)
 
 
+def wheels_world(wheels_mm, centre_mm, template_heading_deg, Rm=None,
+                 sticker_height_mm=0.0):
+    """Contact patches in world millimetres, moved by the marker's pose.
+
+    The same rigid transform the body box gets, and for the same reason: the
+    wheels are fixed in the car, so whatever moved the marker moved them. When
+    a tilt was measured they go through it in three dimensions like the body,
+    sitting one sticker height below the marker in its own frame.
+    """
+    pts = np.array([wheels_mm[n] for n in ("fl", "fr", "rl", "rr")], dtype=np.float64)
+    if Rm is None:
+        a = math.radians(template_heading_deg)
+        c, s = math.cos(a), math.sin(a)
+        return pts @ np.array([[c, -s], [s, c]], dtype=np.float64).T \
+            + np.asarray(centre_mm).reshape(2)
+    p3 = np.column_stack([pts, np.full(len(pts), -float(sticker_height_mm))])
+    return (p3 @ np.asarray(Rm, dtype=np.float64).T)[:, :2] \
+        + np.asarray(centre_mm).reshape(2)
+
+
 def sticker_quad(centre_mm, heading_deg, width_mm, height_mm):
     """The matched template's own outline, in world millimetres.
 
@@ -373,7 +422,8 @@ def subpixel_peak(resp, x, y) -> tuple[float, float]:
     return x + dx, y + dy
 
 
-def synthesise_raw_template(template, template_mm_per_px, plane: PlaneMap, ref_mm):
+def synthesise_raw_template(template, template_mm_per_px, plane: PlaneMap, ref_mm,
+                            y_up=True):
     """Project the metric template onto the camera frame at one world point.
 
     This is what removes the need for a hand-cut camera-frame crop: the metric
@@ -384,11 +434,16 @@ def synthesise_raw_template(template, template_mm_per_px, plane: PlaneMap, ref_m
     axes back to the metric template's world-aligned frame.
     """
     th, tw = template.shape[:2]
-    # Template pixels are metric with +X right and +Y *down*, i.e. world -Y.
+    # Template pixels are metric with +X right. Whether a row down the template
+    # is world -Y or world +Y is whichever way the raster it was cut from ran,
+    # and that follows the camera: a left-handed world frame is seen mirrored
+    # from above. Getting this backwards costs nothing visible — the crop still
+    # looks like a marker — and matches nothing.
+    sy = -1.0 if y_up else 1.0
     corners_px = np.array([[0, 0], [tw, 0], [tw, th], [0, th]], dtype=np.float32)
     corners_mm = np.array(
         [[ref_mm[0] + (u - tw / 2) * template_mm_per_px,
-          ref_mm[1] - (v - th / 2) * template_mm_per_px] for u, v in corners_px]
+          ref_mm[1] + sy * (v - th / 2) * template_mm_per_px] for u, v in corners_px]
     )
     img_corners = plane.to_pixel(corners_mm).astype(np.float32)
     x0, y0 = img_corners.min(axis=0)
@@ -568,7 +623,8 @@ def pose_tilt_deg(Rm):
             math.degrees(math.asin(float(np.clip(Rm[2, 1], -1.0, 1.0)))))
 
 
-def polish_where_it_is(pre, plane, template, template_mm_per_px, x, y, theta_deg):
+def polish_where_it_is(pre, plane, template, template_mm_per_px, x, y, theta_deg,
+                       y_up=True):
     """Re-cut the crop at the position just found, then refine once more.
 
     A camera-frame crop is only strictly right at the place it was cut. Away
@@ -584,7 +640,7 @@ def polish_where_it_is(pre, plane, template, template_mm_per_px, x, y, theta_deg
     centre_mm = plane.to_world(np.array([[x, y]]))[0]
     try:
         crop, _, yaw, _quad = synthesise_raw_template(
-            template, template_mm_per_px, plane, centre_mm)
+            template, template_mm_per_px, plane, centre_mm, y_up)
     except SystemExit:
         return None                        # marker projects off-frame here
     got = ecc_refine(pre, preprocess(crop), x, y, theta_deg)
@@ -806,6 +862,11 @@ def main() -> None:
             "only be read on the ground — which misplaces a roof marker by metres."
         )
     plane = PlaneMap(H_car)
+    # Same handedness the template was cut with; see synthesise_raw_template.
+    y_up = True if cal["R"] is None else camera_from_pose(cal["R"], cal["t"])[1] > 0
+    if not y_up:
+        print("  world frame is left-handed — template mapped mirrored to match the "
+              "camera, and the survey", flush=True)
     if args.corner_pnp and cal["R"] is None:
         raise SystemExit(
             "--corner-pnp needs the camera pose to turn corners into a marker attitude; "
@@ -851,7 +912,7 @@ def main() -> None:
     tpl_w_mm = template.shape[1] * args.template_mm_per_px
     tpl_h_mm = template.shape[0] * args.template_mm_per_px
     crop, ref_mm_per_px, yaw_ref, _quad_ref = synthesise_raw_template(
-        template, args.template_mm_per_px, plane, ref)
+        template, args.template_mm_per_px, plane, ref, y_up)
 
     # Scale bands: what the plane predicts the crop needs across the region.
     scales = np.array([ref_mm_per_px / max(plane.mm_per_px(p), 1e-9) for p in grid])
@@ -911,6 +972,8 @@ def main() -> None:
               + [f"box{i}_{ax}_mm" for i in range(1, 5) for ax in ("x", "y")]
               + ["sticker_height_mm", "pitch_deg", "roll_deg", "plane_fit"]
               + [f"stick{i}_{ax}_mm" for i in range(1, 5) for ax in ("x", "y")]
+              + ([f"wheel_{w}_{ax}_mm" for w in ("fl", "fr", "rl", "rr") for ax in ("x", "y")]
+                 if car.get("wheels_mm") else [])
               + [c for r in rois for c in (f"{r['name']}_mm", f"{r['name']}_hit")]
               + ["scale", "expected_scale", "scale_ratio"])
 
@@ -947,7 +1010,8 @@ def main() -> None:
             # metric template's frame.
             centre_px = np.array([x, y])
             tpl_heading = norm_deg(plane.world_heading(centre_px, theta) + yaw_ref)
-            fixed = polish_where_it_is(pre, plane, template, args.template_mm_per_px, x, y, theta)
+            fixed = polish_where_it_is(pre, plane, template, args.template_mm_per_px,
+                                       x, y, theta, y_up)
             if fixed is not None:
                 x, y, tpl_heading, cc = fixed
                 centre_px = np.array([x, y])
@@ -959,7 +1023,7 @@ def main() -> None:
             local_mm_px = plane.mm_per_px(centre_px)
             expected = ref_mm_per_px / max(local_mm_px, 1e-9)
             pitch = roll = None
-            fit = "planar"
+            fit, Rm_used = "planar", None
 
             # Same detection, read two ways. The planar answer above is kept as
             # the fallback: the corner fit is the better model but the more
@@ -968,7 +1032,7 @@ def main() -> None:
             if args.corner_pnp and cal["R"] is not None:
                 try:
                     crop_c, _mm, _yaw, quad_c = synthesise_raw_template(
-                        template, args.template_mm_per_px, plane, centre)
+                        template, args.template_mm_per_px, plane, centre, y_up)
                 except SystemExit:
                     crop_c = None
                 if crop_c is not None:
@@ -982,7 +1046,7 @@ def main() -> None:
                                 car["body_mm"], centre, Rm, car["sticker_height_mm"])
                             heading = norm_deg(tpl_h2 + car["yaw_offset_deg"])
                             pitch, roll = pose_tilt_deg(Rm)
-                            fit = "corner-pnp"
+                            fit, Rm_used = "corner-pnp", Rm
 
             row = [idx, f"{t:.4f}", 1, method, f"{score:.4f}", f"{sigma_px * local_mm_px:.3f}",
                    f"{centre[0]:.1f}", f"{centre[1]:.1f}", f"{heading:.3f}"]
@@ -991,6 +1055,10 @@ def main() -> None:
                     "" if pitch is None else f"{pitch:.3f}",
                     "" if roll is None else f"{roll:.3f}", fit]
             row += [f"{v:.1f}" for corner in quad for v in corner]
+            if car.get("wheels_mm"):
+                wpts = wheels_world(car["wheels_mm"], centre, tpl_heading, Rm_used,
+                                    car["sticker_height_mm"])
+                row += [f"{v:.1f}" for w in wpts for v in w]
             for r in rois:
                 gap, hit = clearance_mm(box, r["world_mm"], r["closed"])
                 row += [f"{gap:.1f}", int(hit)]

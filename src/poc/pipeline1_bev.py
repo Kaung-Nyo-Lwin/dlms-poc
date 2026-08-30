@@ -76,6 +76,25 @@ def load_calibration(path: Path) -> dict:
     }
 
 
+def camera_from_pose(R, t):
+    """Camera centre in world millimetres, and which way is up.
+
+    The world frame is whatever the operator laid out on the tarmac, and nothing
+    forces it to be right-handed: point +X along the kerb and +Y across it the
+    other way, and +Z runs into the ground instead of out of it. Every 2D
+    quantity survives that — the ground homography is a map, and a map does not
+    care — so the survey checks out, the residuals are millimetres, and nothing
+    complains. The mistake only surfaces when something is rectified to a height
+    *above* the ground, because every such plane is then built on the wrong side
+    of the tarmac and parallax runs backwards.
+
+    So up is taken from the camera, which is unarguably above the ground, rather
+    than from the frame's own +Z.
+    """
+    centre = -np.asarray(R, dtype=np.float64).T @ np.asarray(t, dtype=np.float64)
+    return centre, (1.0 if centre[2] >= 0 else -1.0)
+
+
 def homography_at_height(K: np.ndarray, R: np.ndarray, t: np.ndarray, height_mm: float):
     """Image -> world (X, Y) for the horizontal plane Z = height_mm.
 
@@ -83,7 +102,8 @@ def homography_at_height(K: np.ndarray, R: np.ndarray, t: np.ndarray, height_mm:
     inverting that 3x3 gives pixels back as the (X, Y) *directly below* a marker
     at that height — which is exactly what the car-box arithmetic wants.
     """
-    Hw2i = K @ np.column_stack([R[:, 0], R[:, 1], R[:, 2] * float(height_mm) + t])
+    _, up = camera_from_pose(R, t)
+    Hw2i = K @ np.column_stack([R[:, 0], R[:, 1], R[:, 2] * (up * float(height_mm)) + t])
     H = np.linalg.inv(Hw2i)
     return H / H[2, 2]
 
@@ -114,11 +134,20 @@ def load_car(path: Path) -> dict:
         a = math.radians(yaw)
         c, s = math.cos(a), math.sin(a)
         body = car @ np.array([[c, -s], [s, c]]).T
+    wheels = raw.get("wheels_mm") or None
+    if wheels:
+        wheels = {k: np.array([v["x_mm"], v["y_mm"]], dtype=np.float64)
+                  for k, v in wheels.items()}
     return {
         "car_id": str(raw.get("car_id", "car")),
         "body_mm": body,
         "yaw_offset_deg": yaw,
         "sticker_height_mm": float(raw["sticker_height_mm"]),
+        # Contact patches, in the same template frame as the body and moved by
+        # the same rigid transform. Absent when the survey did not measure them,
+        # and every wheel rule then scores as not-evaluated rather than as passed.
+        "wheels_mm": wheels,
+        "tyre_width_mm": raw.get("tyre_width_mm"),
     }
 
 
@@ -196,15 +225,24 @@ def norm_deg(a: float) -> float:
     return 180.0 if a == -180.0 else a
 
 
-def bev_matrices(x_min, y_min, mm_per_px, w_px, h_px):
-    """World millimetres <-> raster pixels. Rows increase as +Y decreases."""
+def bev_matrices(x_min, y_min, mm_per_px, w_px, h_px, y_up=True):
+    """World millimetres <-> raster pixels. With ``y_up``, rows increase as +Y decreases.
+
+    This has to match the convention the template was cut with, which is why it
+    is a parameter rather than a constant: a world frame whose +Z runs into the
+    ground is seen mirrored from above (see :func:`camera_from_pose`), and a
+    template cut one way will not correlate with a raster built the other way at
+    any rotation. Both ends take it from the camera, so both agree.
+    """
     y_max = y_min + h_px * mm_per_px
-    w2b = np.array(
+    w2b = (np.array(
         [[1.0 / mm_per_px, 0.0, -x_min / mm_per_px],
          [0.0, -1.0 / mm_per_px, y_max / mm_per_px],
-         [0.0, 0.0, 1.0]],
-        dtype=np.float64,
-    )
+         [0.0, 0.0, 1.0]], dtype=np.float64)
+        if y_up else np.array(
+        [[1.0 / mm_per_px, 0.0, -x_min / mm_per_px],
+         [0.0, 1.0 / mm_per_px, -y_min / mm_per_px],
+         [0.0, 0.0, 1.0]], dtype=np.float64))
     return w2b, np.linalg.inv(w2b)
 
 
@@ -310,6 +348,26 @@ def pose_tilt_deg(Rm):
     pitch = math.degrees(math.asin(float(np.clip(-Rm[2, 0], -1.0, 1.0))))
     roll = math.degrees(math.asin(float(np.clip(Rm[2, 1], -1.0, 1.0))))
     return pitch, roll
+
+
+def wheels_world(wheels_mm, centre_mm, template_heading_deg, Rm=None,
+                 sticker_height_mm=0.0):
+    """Contact patches in world millimetres, moved by the marker's pose.
+
+    The same rigid transform the body box gets, and for the same reason: the
+    wheels are fixed in the car, so whatever moved the marker moved them. When
+    a tilt was measured they go through it in three dimensions like the body,
+    sitting one sticker height below the marker in its own frame.
+    """
+    pts = np.array([wheels_mm[n] for n in ("fl", "fr", "rl", "rr")], dtype=np.float64)
+    if Rm is None:
+        a = math.radians(template_heading_deg)
+        c, s = math.cos(a), math.sin(a)
+        return pts @ np.array([[c, -s], [s, c]], dtype=np.float64).T \
+            + np.asarray(centre_mm).reshape(2)
+    p3 = np.column_stack([pts, np.full(len(pts), -float(sticker_height_mm))])
+    return (p3 @ np.asarray(Rm, dtype=np.float64).T)[:, :2] \
+        + np.asarray(centre_mm).reshape(2)
 
 
 def sticker_quad(centre_mm, heading_deg, width_mm, height_mm):
@@ -703,7 +761,13 @@ def main() -> None:
     w_px, h_px = int(np.ceil((x_max - x_min) / mmpp)), int(np.ceil((y_max - y_min) / mmpp))
     if w_px * h_px > 40_000_000:
         raise SystemExit(f"raster would be {w_px}x{h_px} px; raise --mm-per-px or cut --margin-mm")
-    w2b, b2w = bev_matrices(x_min, y_min, mmpp, w_px, h_px)
+    # Same handedness the template was cut with. Without a pose we cannot tell,
+    # and the ordinary map convention is the right guess.
+    y_up = True if cal["R"] is None else camera_from_pose(cal["R"], cal["t"])[1] > 0
+    if not y_up:
+        print("  world frame is left-handed — raster mirrored to match the camera, "
+              "and the template", flush=True)
+    w2b, b2w = bev_matrices(x_min, y_min, mmpp, w_px, h_px, y_up=y_up)
 
     template = cv2.imread(str(args.template), cv2.IMREAD_COLOR)
     if template is None:
@@ -752,6 +816,8 @@ def main() -> None:
               + [f"box{i}_{ax}_mm" for i in range(1, 5) for ax in ("x", "y")]
               + ["sticker_height_mm", "pitch_deg", "roll_deg", "plane_fit"]
               + [f"stick{i}_{ax}_mm" for i in range(1, 5) for ax in ("x", "y")]
+              + ([f"wheel_{w}_{ax}_mm" for w in ("fl", "fr", "rl", "rr") for ax in ("x", "y")]
+                 if car.get("wheels_mm") else [])
               + [c for r in rois for c in (f"{r['name']}_mm", f"{r['name']}_hit")])
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
@@ -791,7 +857,7 @@ def main() -> None:
             box, heading = car_box(car["body_mm"], centre, tpl_heading, car["yaw_offset_deg"])
             quad = sticker_quad(centre, tpl_heading, tpl_w_mm, tpl_h_mm)
             pitch = roll = None
-            fit = "planar"
+            fit, Rm_used = "planar", None
 
             # Same detection, read two ways. The planar answer above is kept as
             # the fallback: the corner fit is the better model but the more
@@ -811,7 +877,7 @@ def main() -> None:
                         heading = norm_deg(tpl_h2 + car["yaw_offset_deg"])
                         quad = apply_h(b2w, quad_bev)
                         pitch, roll = pose_tilt_deg(Rm)
-                        fit = "corner-pnp"
+                        fit, Rm_used = "corner-pnp", Rm
 
             row = [idx, f"{t:.4f}", 1, method, f"{score:.4f}", f"{sigma_px * mmpp:.3f}",
                    f"{centre[0]:.1f}", f"{centre[1]:.1f}", f"{heading:.3f}"]
@@ -820,6 +886,10 @@ def main() -> None:
                     "" if pitch is None else f"{pitch:.3f}",
                     "" if roll is None else f"{roll:.3f}", fit]
             row += [f"{v:.1f}" for corner in quad for v in corner]
+            if car.get("wheels_mm"):
+                wpts = wheels_world(car["wheels_mm"], centre, tpl_heading, Rm_used,
+                                    car["sticker_height_mm"])
+                row += [f"{v:.1f}" for w in wpts for v in w]
             for r in rois:
                 gap, hit = clearance_mm(box, r["world_mm"], r["closed"])
                 row += [f"{gap:.1f}", int(hit)]

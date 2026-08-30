@@ -3,7 +3,8 @@
 One page, three modes, shared by every survey step in ``calibrate.py``:
 
 * ``points``  — click N (or any number of) locations; optionally type a world
-  coordinate for each, which is what a ground-control survey is.
+  coordinate for each, which is what a ground-control survey is, or a taped
+  length for each pair, which is what a scale check is.
 * ``box``     — drag a rectangle, then nudge it; used to cut a sticker template.
 * ``shapes``  — draw named points / lines / polygons; used for ROIs.
 
@@ -152,15 +153,45 @@ def _serve(image: np.ndarray, meta: dict, open_browser: bool = True) -> dict | N
 # --------------------------------------------------------------------------
 
 
-def pick_points(image, title, n=None, world=False, snap=True, hint="", open_browser=True):
+def pick_points(image, title, n=None, world=False, snap=True, hint="", open_browser=True,
+                focus=None):
     """Click locations. ``world=True`` also asks for each point's X,Y in mm.
+
+    ``focus`` is ``(x, y, span)`` in image pixels: open centred there, zoomed so
+    that ``span`` fills the window, instead of fitted to the whole image. `r`
+    still resets to the fit. Worth passing whenever the caller already knows
+    roughly where the subject is — on a full station frame it is the difference
+    between clicking and hunting.
 
     Returns ``[{"px": [x, y], "world_mm": [X, Y]}, ...]`` (``world_mm`` absent
     when ``world`` is False), or None if cancelled.
     """
     got = _serve(image, {"mode": "points", "title": title, "n": n, "world": world,
-                         "snap": snap, "hint": hint}, open_browser)
+                         "snap": snap, "hint": hint,
+                         "focus": None if focus is None else [float(v) for v in focus]},
+                 open_browser)
     return None if got is None else got.get("points")
+
+
+def pick_bars(image, title, hint="", open_browser=True, focus=None):
+    """Click the two ends of each taped length. Returns a list of bars, or None.
+
+    The same page as ``pick_points``, with the toolbar field holding one number
+    instead of two: type the millimetres the tape read, then click both ends.
+    Unlike a ground control point, neither end needs a world coordinate — the
+    length is the whole observation, which is what makes these cheap to lay.
+
+    Returns ``[{"a_px": [x, y], "b_px": [x, y], "length_mm": d}, ...]``.
+    """
+    got = _serve(image, {"mode": "points", "title": title, "n": None, "world": False,
+                         "bars": True, "snap": True, "hint": hint,
+                         "focus": None if focus is None else [float(v) for v in focus]},
+                 open_browser)
+    if got is None or not got.get("points"):
+        return None
+    pts = got["points"]
+    return [{"a_px": pts[i]["px"], "b_px": pts[i + 1]["px"],
+             "length_mm": float(pts[i]["len_mm"])} for i in range(0, len(pts) - 1, 2)]
 
 
 def pick_box(image, title, mm_per_px=None, hint="", open_browser=True):
@@ -175,6 +206,25 @@ def pick_box(image, title, mm_per_px=None, hint="", open_browser=True):
         return None
     x0, y0, x1, y1 = got["box"]
     return min(x0, x1), min(y0, y1), abs(x1 - x0), abs(y1 - y0)
+
+
+def review_layers(image, title, layers, marks=(), hint="", open_browser=True):
+    """Show worked-out overlays for approval. True to accept, None to redo.
+
+    ``layers`` is a list of ``{"name", "points", "closed", "colour", "on"}`` in
+    image pixels, each with its own toolbar toggle. ``marks`` are drawn always,
+    for the raw clicks an adjustment moved.
+
+    The page draws and nothing else: every coordinate is computed in Python and
+    handed over finished. A preview that recomputed the geometry in JavaScript
+    would be a second implementation free to drift from the first, and the one
+    thing a preview must never do is agree with itself while disagreeing with
+    the file.
+    """
+    got = _serve(image, {"mode": "review", "title": title, "hint": hint,
+                         "layers": list(layers), "marks": [list(m) for m in marks],
+                         "snap": False}, open_browser)
+    return None if got is None else bool(got.get("ok"))
 
 
 def pick_shapes(image, title, hint="", open_browser=True):
@@ -207,6 +257,7 @@ _PAGE = r"""<!doctype html><meta charset=utf-8><title>survey</title>
   <b id=title>…</b><span class=muted id=hint></span>
   <span class=muted id=stat></span><span id=msg></span>
   <input id=entry autocomplete=off>
+  <span id=layerbtns style=display:none></span>
   <span id=shapebtns style=display:none>
     <button class="g s" data-t=point>point (p)</button>
     <button class="g s" data-t=line>line (l)</button>
@@ -252,6 +303,17 @@ const post = (p, b) => fetch(p + Q, {method: "POST", headers: {"Content-Type": "
                                      body: JSON.stringify(b || {})}).then(r => r.json());
 
 function resize() { cv.width = innerWidth; cv.height = innerHeight; draw(); }
+// Open on the thing being clicked, not on the whole frame. A station image is
+// 3840 px wide and the car is a fifth of it, so fitting the lot means every pass
+// starts by scrolling and scrubbing to find the subject. `focus` is [x, y, span]
+// in image pixels: centre there, and zoom so that span fills most of the window.
+function focusView() {
+  if (!meta.focus) return false;
+  const [fx, fy, span] = meta.focus;
+  cx = fx; cy = fy;
+  zoom = Math.min(60, Math.max(0.02, Math.min(W(), H()) * 0.8 / Math.max(span, 1)));
+  return true;
+}
 function reset() { zoom = Math.min(W() / meta.width, H() / meta.height);
                    cx = meta.width / 2; cy = meta.height / 2; draw(); }
 
@@ -279,12 +341,27 @@ function draw() {
   };
   g.font = "12px ui-monospace, monospace";
 
-  if (meta.mode === "points") pts.forEach((p, i) => dot(p.px, "#f778ba", labelOf(p, i)));
+  if (meta.mode === "points") {
+    if (meta.bars)
+      for (let i = 0; i + 1 < pts.length; i += 2)
+        chain([pts[i].px, pts[i + 1].px], "#f778ba", false);
+    pts.forEach((p, i) => dot(p.px, "#f778ba", labelOf(p, i)));
+  }
   if (meta.mode === "shapes") {
     shapes.forEach(s => { chain(s.points_px, "#3fb950", s.type === "polygon");
                           s.points_px.forEach(q => dot(q, "#3fb950"));
                           dot(s.points_px[0], "#3fb950", s.name); });
     chain(cur, "#ffa657", false); cur.forEach(q => dot(q, "#ffa657"));
+  }
+  if (meta.mode === "review") {
+    // Nothing is computed here. Every coordinate arrived from Python already
+    // worked out, so what is drawn cannot disagree with what gets written.
+    (meta.marks || []).forEach(q => dot(q, "#8b949e"));
+    (meta.layers || []).forEach(L => {
+      if (!L.on) return;
+      chain(L.points, L.colour, L.closed);
+      L.points.forEach(q => dot(q, L.colour));
+    });
   }
   if (meta.mode === "box" && box) {
     const [x0, y0] = toScr(box[0], box[1]), [x1, y1] = toScr(box[2], box[3]);
@@ -295,6 +372,7 @@ function draw() {
 }
 
 function labelOf(p, i) {
+  if (meta.bars) return i % 2 ? "" : `bar ${i / 2 + 1}: ${p.len_mm} mm`;
   return p.world_mm ? `${i + 1}: ${p.world_mm[0]}, ${p.world_mm[1]} mm` : String(i + 1);
 }
 
@@ -318,6 +396,9 @@ function status() {
   }
   if (meta.mode === "shapes")
     s += cur.length ? ` · ${cur.length} pt open — p / l / g to finish` : " · no shape open";
+  if (meta.mode === "points" && meta.bars)
+    s += pts.length % 2 ? " · one end down — click the other"
+                        : ` · ${pts.length / 2} bar(s)`;
   document.getElementById("stat").textContent = s;
   const L = document.getElementById("list");
   const rows = meta.mode === "shapes"
@@ -340,9 +421,20 @@ async function place(sx, sy) {
       if (v.length !== 2 || v.some(isNaN)) return say("need two numbers, e.g.  1800, 0", 1);
       p.world_mm = v;
       takeEntry();
+    } else if (meta.bars && pts.length % 2 === 0) {
+      // The length belongs to the pair, and is read once, at the end that opens
+      // it — so `u` takes the length back out with the click that carried it.
+      const t = entry().value.trim();
+      if (!t) return say("type the taped length in mm in the box first, then click both ends", 1);
+      const v = Number(t);
+      if (!isFinite(v) || v <= 0) return say("need one positive length in mm, e.g.  10000", 1);
+      p.len_mm = v;
+      takeEntry();
     }
     pts.push(p);
     if (meta.world) say(`point ${pts.length} at ${p.world_mm[0]}, ${p.world_mm[1]} mm`);
+    if (meta.bars) say(pts.length % 2 ? `bar ${(pts.length + 1) / 2} open — click the other end`
+                                      : `bar ${pts.length / 2} closed`);
   } else if (meta.mode === "shapes") {
     cur.push([ix, iy]);
   }
@@ -363,6 +455,7 @@ cv.addEventListener("mousedown", e => {
   mouse = [e.offsetX, e.offsetY];
   if (e.button === 1 || e.shiftKey) { drag = [e.offsetX, e.offsetY]; return; }
   if (e.button === 2) return;
+  if (meta.mode === "review") return;             // look, do not edit
   if (meta.mode === "box") { const p = toImg(e.offsetX, e.offsetY); box = [p[0], p[1], p[0], p[1]];
                              drag = "box"; return; }
   place(e.offsetX, e.offsetY);
@@ -417,9 +510,12 @@ addEventListener("keydown", e => {
 });
 
 async function save() {
+  if (meta.mode === "review") { await post("/done", {ok: true}); return bye(null, "accepted"); }
   if (meta.mode === "points") {
     if (meta.n && pts.length !== meta.n) return say(`need exactly ${meta.n} points`, 1);
     if (!pts.length) return say("nothing picked", 1);
+    if (meta.bars && pts.length % 2)
+      return say("the last bar has only one end — click the other, or press u", 1);
     await post("/done", {points: pts});
   } else if (meta.mode === "box") {
     if (!box) return say("drag a box first", 1);
@@ -441,17 +537,31 @@ fetch("/meta" + Q).then(r => r.json()).then(m => {
   meta = m;
   document.getElementById("title").textContent = m.title;
   document.getElementById("hint").textContent = m.hint || "";
-  if (m.mode === "shapes" || m.world) {
+  if (m.mode === "shapes" || m.world || m.bars) {
     entry().style.display = "";
-    entry().placeholder = m.world ? "world X, Y in mm — then click the mark"
+    entry().placeholder = m.bars ? "taped length in mm — then click both ends"
+                        : m.world ? "world X, Y in mm — then click the mark"
                                   : "name for the next shape (optional)";
+  }
+  if (m.mode === "review") {
+    const host = document.getElementById("layerbtns");
+    host.style.display = "";
+    m.layers.forEach(L => {
+      const b = document.createElement("button");
+      b.textContent = L.name;
+      b.className = L.on ? "" : "g";
+      b.onclick = () => { L.on = !L.on; b.className = L.on ? "" : "g"; draw(); };
+      host.appendChild(b);
+    });
+    document.getElementById("ok").textContent = "Looks right — save (Enter)";
+    document.getElementById("no").textContent = "Redo (Esc)";
   }
   if (m.mode === "shapes") document.getElementById("shapebtns").style.display = "";
   if (m.mode === "shapes")
     document.getElementById("hint").textContent =
       (m.hint ? m.hint + " · " : "") + "finish a shape: p point · l line · g polygon";
   snap = m.snap !== false;
-  img.onload = () => { resize(); reset(); };
+  img.onload = () => { resize(); reset(); if (focusView()) draw(); };
   img.src = "/image.png" + Q;
 });
 addEventListener("resize", resize);
