@@ -1,0 +1,45 @@
+{
+  "_comment": "pixels are in the UNDISTORTED frame; read on the ground plane",
+  "rois": [
+    {
+      "name": "1",
+      "type": "point",
+      "points_px": [
+        [
+          2494.635986328125,
+          1467.5472412109375
+        ]
+      ]
+    },
+    {
+      "name": "2",
+      "type": "point",
+      "points_px": [
+        [
+          1561.6258544921875,
+          1299.703125
+        ]
+      ]
+    },
+    {
+      "name": "3",
+      "type": "point",
+      "points_px": [
+        [
+          1162.0003662109375,
+          1134.8536376953125
+        ]
+      ]
+    },
+    {
+      "name": "4",
+      "type": "point",
+      "points_px": [
+        [
+          1879.1434353223203,
+          935.2169573532996
+        ]
+      ]
+    }
+  ]
+}

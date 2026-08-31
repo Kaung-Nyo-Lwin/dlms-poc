@@ -1,0 +1,498 @@
+{
+  "schema_version": 1,
+  "station": "B7",
+  "source": "doc/DSR.xlsx",
+  "rois": [
+    {
+      "name": "any_boundary",
+      "type": "line",
+      "points_px": [
+        [
+          2367.1875,
+          1717.03125
+        ],
+        [
+          2651.654296875,
+          1213.8001708984375
+        ]
+      ],
+      "note": "every boundary line of this station; draw one shape per side"
+    },
+    {
+      "name": "curb",
+      "type": "line",
+      "points_px": [
+        [
+          2378.846435546875,
+          1814.421875
+        ],
+        [
+          2691.863037109375,
+          1291.7169189453125
+        ],
+        [
+          2605.744384765625,
+          1377.416015625
+        ],
+        [
+          2559.718017578125,
+          1468.4913330078125
+        ],
+        [
+          2464.440185546875,
+          1651.3995361328125
+        ]
+      ],
+      "note": "the kerb edge, for parallel-parking clearance"
+    },
+    {
+      "name": "front_boundary",
+      "type": "line",
+      "points_px": [
+        [
+          2396.71875,
+          1636.875
+        ],
+        [
+          2645.625,
+          1206.5625
+        ]
+      ],
+      "note": "the forward limit of the station box"
+    },
+    {
+      "name": "rear_boundary",
+      "type": "line",
+      "points_px": [
+        [
+          2190.87744140625,
+          1580.478759765625
+        ],
+        [
+          1218.87744140625,
+          1141.998779296875
+        ]
+      ],
+      "note": "the rear limit of the station box"
+    },
+    {
+      "name": "right_line",
+      "type": "line",
+      "points_px": [
+        [
+          2569.6875,
+          1105.3125
+        ],
+        [
+          1502.34375,
+          814.21875
+        ]
+      ],
+      "note": "the line the right-hand wheels must reach"
+    },
+    {
+      "name": "stop_line",
+      "type": "line",
+      "points_px": [
+        [
+          1219.6875,
+          1134.84375
+        ],
+        [
+          1506.407958984375,
+          829.0723876953125
+        ]
+      ],
+      "note": "the painted stop line the car must halt at"
+    }
+  ],
+  "rules": [
+    {
+      "id": "B7R2",
+      "station": "B7",
+      "alt_station": "C6",
+      "item": "2",
+      "detail": "Not driving straight before reversing into station",
+      "points": "35",
+      "dsr_row": 12,
+      "dsr_condition": "",
+      "dsr_time_s": "",
+      "dsr_distance_cm": "",
+      "image_processing": true,
+      "web_app": false,
+      "needs": [],
+      "check": "straight_before_reverse",
+      "params": {
+        "max_deg": 10
+      },
+      "enabled": true
+    },
+    {
+      "id": "B7R3",
+      "station": "B7",
+      "alt_station": "C6",
+      "item": "3",
+      "detail": "Driving straight, front bumper exceeds front boundary (Deduct every time)",
+      "points": "5",
+      "dsr_row": 13,
+      "dsr_condition": "",
+      "dsr_time_s": "",
+      "dsr_distance_cm": "",
+      "image_processing": true,
+      "web_app": false,
+      "needs": [],
+      "check": "exceed",
+      "params": {
+        "roi": "front_boundary",
+        "part": "front_bumper",
+        "every_time": true
+      },
+      "enabled": true
+    },
+    {
+      "id": "B7R4",
+      "station": "B7",
+      "alt_station": "C6",
+      "item": "4",
+      "detail": "Reversing, rear bumper hits rear boundary (Small car)",
+      "points": "5",
+      "dsr_row": 14,
+      "dsr_condition": "",
+      "dsr_time_s": "",
+      "dsr_distance_cm": "",
+      "image_processing": true,
+      "web_app": false,
+      "needs": [],
+      "check": "exceed",
+      "params": {
+        "roi": "rear_boundary",
+        "part": "rear_bumper",
+        "every_time": false
+      },
+      "enabled": true
+    },
+    {
+      "id": "B7R5",
+      "station": "B7",
+      "alt_station": "C6",
+      "item": "5",
+      "detail": "Reversing, rear wheels hit rear boundary (Large car)",
+      "points": "5",
+      "dsr_row": 15,
+      "dsr_condition": "",
+      "dsr_time_s": "",
+      "dsr_distance_cm": "",
+      "image_processing": true,
+      "web_app": false,
+      "needs": [
+        "wheels"
+      ],
+      "check": "exceed",
+      "params": {
+        "roi": "rear_boundary",
+        "part": "rear_wheels"
+      },
+      "enabled": true
+    },
+    {
+      "id": "B7R6",
+      "station": "B7",
+      "alt_station": "C6",
+      "item": "6",
+      "detail": "Right front and rear wheels stop on line for \u2265 5s & pull handbrake (Pass)",
+      "points": "0",
+      "dsr_row": 16,
+      "dsr_condition": "More than",
+      "dsr_time_s": "5",
+      "dsr_distance_cm": "",
+      "image_processing": true,
+      "web_app": true,
+      "needs": [
+        "wheels",
+        "handbrake"
+      ],
+      "check": "dwell",
+      "params": {
+        "roi": "right_line",
+        "part": "right_wheels",
+        "seconds": 5,
+        "cmp": "ge",
+        "pass_rule": true
+      },
+      "enabled": true
+    },
+    {
+      "id": "B7R8",
+      "station": "B7",
+      "alt_station": "C6",
+      "item": "8",
+      "detail": "Right front or rear wheel on line or exceeds (angle < 10 degrees)",
+      "points": "5",
+      "dsr_row": 17,
+      "dsr_condition": "",
+      "dsr_time_s": "",
+      "dsr_distance_cm": "",
+      "image_processing": true,
+      "web_app": false,
+      "needs": [
+        "wheels"
+      ],
+      "check": "wheel_on_line",
+      "params": {
+        "roi": "right_line",
+        "part": "right_wheels",
+        "max_deg": 10
+      },
+      "enabled": true
+    },
+    {
+      "id": "B7R9",
+      "station": "B7",
+      "alt_station": "C6",
+      "item": "9",
+      "detail": "Right front/rear wheels don't reach line or angle > 10 degrees (Incomplete)",
+      "points": "15",
+      "dsr_row": 18,
+      "dsr_condition": "",
+      "dsr_time_s": "",
+      "dsr_distance_cm": "",
+      "image_processing": true,
+      "web_app": false,
+      "needs": [
+        "wheels"
+      ],
+      "check": "wheel_short_of_line",
+      "params": {
+        "roi": "right_line",
+        "part": "right_wheels",
+        "max_deg": 10
+      },
+      "enabled": true
+    },
+    {
+      "id": "GENR1",
+      "station": "GEN",
+      "alt_station": "",
+      "item": "-",
+      "detail": "Driving to stations out of order",
+      "points": "35",
+      "dsr_row": 27,
+      "dsr_condition": "",
+      "dsr_time_s": "",
+      "dsr_distance_cm": "",
+      "image_processing": false,
+      "web_app": true,
+      "needs": [
+        "sticker_id"
+      ],
+      "check": "station_order",
+      "params": {},
+      "enabled": true
+    },
+    {
+      "id": "GENR2",
+      "station": "GEN",
+      "alt_station": "",
+      "item": "-",
+      "detail": "Driving past station / completely over stop line (Test Failed)",
+      "points": "Fail/35",
+      "dsr_row": 28,
+      "dsr_condition": "",
+      "dsr_time_s": "",
+      "dsr_distance_cm": "",
+      "image_processing": true,
+      "web_app": true,
+      "needs": [],
+      "check": "exceed",
+      "params": {
+        "roi": "stop_line",
+        "part": "body",
+        "fail": true
+      },
+      "enabled": true
+    },
+    {
+      "id": "GENR3",
+      "station": "GEN",
+      "alt_station": "",
+      "item": "-",
+      "detail": "Driving on the curb with two wheels",
+      "points": "5",
+      "dsr_row": 29,
+      "dsr_condition": "",
+      "dsr_time_s": "",
+      "dsr_distance_cm": "",
+      "image_processing": true,
+      "web_app": false,
+      "needs": [
+        "wheels"
+      ],
+      "check": "on_roi",
+      "params": {
+        "roi": "curb",
+        "part": "wheels",
+        "count": 2
+      },
+      "enabled": true
+    },
+    {
+      "id": "GENR4",
+      "station": "GEN",
+      "alt_station": "",
+      "item": "-",
+      "detail": "Overtaking another car",
+      "points": "5",
+      "dsr_row": 30,
+      "dsr_condition": "",
+      "dsr_time_s": "",
+      "dsr_distance_cm": "",
+      "image_processing": true,
+      "web_app": false,
+      "needs": [
+        "multi_vehicle"
+      ],
+      "check": "overtake",
+      "params": {},
+      "enabled": true
+    },
+    {
+      "id": "GENR5",
+      "station": "GEN",
+      "alt_station": "",
+      "item": "-",
+      "detail": "Entering station not according to format",
+      "points": "5",
+      "dsr_row": 31,
+      "dsr_condition": "",
+      "dsr_time_s": "",
+      "dsr_distance_cm": "",
+      "image_processing": false,
+      "web_app": false,
+      "needs": [],
+      "check": "manual",
+      "params": {},
+      "enabled": true
+    },
+    {
+      "id": "GENR6",
+      "station": "GEN",
+      "alt_station": "",
+      "item": "-",
+      "detail": "Driving over stop line",
+      "points": "5",
+      "dsr_row": 32,
+      "dsr_condition": "",
+      "dsr_time_s": "",
+      "dsr_distance_cm": "",
+      "image_processing": true,
+      "web_app": false,
+      "needs": [],
+      "check": "exceed",
+      "params": {
+        "roi": "stop_line",
+        "part": "front_bumper"
+      },
+      "enabled": true
+    },
+    {
+      "id": "GENR7",
+      "station": "GEN",
+      "alt_station": "",
+      "item": "-",
+      "detail": "Bumper exceeds or hits boundary (Per occurrence)",
+      "points": "5",
+      "dsr_row": 33,
+      "dsr_condition": "",
+      "dsr_time_s": "",
+      "dsr_distance_cm": "",
+      "image_processing": true,
+      "web_app": false,
+      "needs": [],
+      "check": "exceed",
+      "params": {
+        "roi": "any_boundary",
+        "part": "bumpers",
+        "every_time": true
+      },
+      "enabled": true
+    },
+    {
+      "id": "GENR8",
+      "station": "GEN",
+      "alt_station": "",
+      "item": "-",
+      "detail": "Driving on the curb with one wheel",
+      "points": "5",
+      "dsr_row": 34,
+      "dsr_condition": "",
+      "dsr_time_s": "",
+      "dsr_distance_cm": "",
+      "image_processing": true,
+      "web_app": false,
+      "needs": [
+        "wheels"
+      ],
+      "check": "on_roi",
+      "params": {
+        "roi": "curb",
+        "part": "wheels",
+        "count": 1
+      },
+      "enabled": true
+    },
+    {
+      "id": "GENR9",
+      "station": "GEN",
+      "alt_station": "",
+      "item": "-",
+      "detail": "Engine stalls during test",
+      "points": "5",
+      "dsr_row": 35,
+      "dsr_condition": "",
+      "dsr_time_s": "",
+      "dsr_distance_cm": "",
+      "image_processing": false,
+      "web_app": false,
+      "needs": [],
+      "check": "manual",
+      "params": {},
+      "enabled": true
+    },
+    {
+      "id": "GENR10",
+      "station": "GEN",
+      "alt_station": "",
+      "item": "-",
+      "detail": "Handbrake left pulled while driving",
+      "points": "5",
+      "dsr_row": 36,
+      "dsr_condition": "",
+      "dsr_time_s": "",
+      "dsr_distance_cm": "",
+      "image_processing": false,
+      "web_app": true,
+      "needs": [],
+      "check": "manual",
+      "params": {},
+      "enabled": true
+    },
+    {
+      "id": "GENR11",
+      "station": "GEN",
+      "alt_station": "",
+      "item": "-",
+      "detail": "Not wearing seatbelt during test",
+      "points": "5",
+      "dsr_row": 37,
+      "dsr_condition": "",
+      "dsr_time_s": "",
+      "dsr_distance_cm": "",
+      "image_processing": false,
+      "web_app": true,
+      "needs": [],
+      "check": "manual",
+      "params": {},
+      "enabled": true
+    }
+  ]
+}

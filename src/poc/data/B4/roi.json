@@ -1,0 +1,19 @@
+{
+  "_comment": "pixels are in the UNDISTORTED frame; read on the ground plane",
+  "rois": [
+    {
+      "name": "T2",
+      "type": "line",
+      "points_px": [
+        [
+          1461.2110595703125,
+          137.40882873535156
+        ],
+        [
+          1864.807373046875,
+          127.63359069824219
+        ]
+      ]
+    }
+  ]
+}

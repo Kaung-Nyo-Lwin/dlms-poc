@@ -1,0 +1,100 @@
+{
+  "car_id": "car",
+  "sticker_height_mm": 1450.0,
+  "outline_height_mm": 160.0,
+  "front_height_mm": 160.0,
+  "side_height_mm": 0.0,
+  "built_from": "front-2",
+  "sticker_yaw_offset_deg": -177.196195410475,
+  "length_mm": 4630.0,
+  "width_mm": 1729.9999999999998,
+  "body_polygon_mm": [
+    {
+      "x_mm": -2565.5124172471415,
+      "y_mm": -1160.1368363453093
+    },
+    {
+      "x_mm": -2650.1372581824053,
+      "y_mm": 567.7921657542215
+    },
+    {
+      "x_mm": 1974.3201289394601,
+      "y_mm": 794.2736764653619
+    },
+    {
+      "x_mm": 2058.944969874725,
+      "y_mm": -933.6553256341691
+    }
+  ],
+  "front_bumper_mm": 2619.1905816454746,
+  "rear_bumper_mm": -2010.8094183545254,
+  "detector_centre_mm": {
+    "x_mm": 3431.318367782618,
+    "y_mm": 1038.3859254026343
+  },
+  "detector_offset_mm": {
+    "x_mm": -1.5107225985466357,
+    "y_mm": -10.844648149649402
+  },
+  "detector_score": 0.8186134696006775,
+  "detector_heading_deg": -0.19696817369020891,
+  "wheels_mm": {
+    "fl": {
+      "x_mm": -1666.5898149988307,
+      "y_mm": -1116.1123526217616
+    },
+    "fr": {
+      "x_mm": -1751.2146559340945,
+      "y_mm": 611.8166494777693
+    },
+    "rl": {
+      "x_mm": 1209.9625121957642,
+      "y_mm": -975.2340047064085
+    },
+    "rr": {
+      "x_mm": 1125.3376712604995,
+      "y_mm": 752.6949973931223
+    }
+  },
+  "front_to_wheel_mm": 900.0,
+  "rear_to_wheel_mm": 850.0,
+  "track_mm": 1729.9999999999998,
+  "wheelbase_mm": 2880.0,
+  "tyre_width_mm": 195.0,
+  "traced": {
+    "corner_order": [
+      "front_left",
+      "front_right",
+      "rear_right",
+      "rear_left"
+    ],
+    "world_mm": [
+      {
+        "x_mm": 864.2952279369301,
+        "y_mm": -132.59555909232458
+      },
+      {
+        "x_mm": 779.6703870016661,
+        "y_mm": 1595.3334430072064
+      },
+      {
+        "x_mm": 5404.127774123532,
+        "y_mm": 1821.8149537183467
+      },
+      {
+        "x_mm": 5488.752615058796,
+        "y_mm": 93.88595161881574
+      }
+    ],
+    "marker_centre_mm": {
+      "x_mm": 3429.8076451840716,
+      "y_mm": 1027.5412772529849
+    },
+    "clicked_front_width_mm": 917.1141389009686,
+    "side_skew_mm": 9.094947017729282e-13,
+    "diagonal_skew_mm": 9.094947017729282e-13,
+    "clicked_on": "bev",
+    "mm_per_px": 8.27
+  },
+  "note": "body_polygon_mm and wheels_mm are in the sticker TEMPLATE frame; the body was traced on the plane at front_height_mm (the flank, when one was clicked, on side_height_mm); the wheels are contact patches on the ground; front/rear_bumper_mm are car-frame distances from the marker"
+}

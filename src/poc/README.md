@@ -439,6 +439,83 @@ the wrong side of the change with nothing downstream to show it. Record both
 against one wall clock at capture, or fix the offset once off an event visible to
 both — the signal itself changing, if it is in both fields of view.
 
+## 4. Score
+
+`score.py` takes a track and a **rules file** — which is not `roi.json`. One file
+holds both halves of a score: the rules, copied from the `dsr_rules.json` beside
+the script, and the regions they are measured against, drawn into it. Keeping
+them together is what makes a scorecard reproducible; a rule citing `stop_line`
+and a `stop_line` clicked six weeks later in another file are related only by
+hope.
+
+```sh
+S=poc/B7
+V=raw/B7/B7_park.mp4
+
+# Seed B7's rules from the DSR catalogue and draw the regions they cite
+python src/poc/calibrate.py rules --image $S/gcp.png \
+    --calibration $S/calibration.json --station B7 --out $S/rules.json
+
+# Track. --rois is optional here: score.py reads the regions from rules.json
+# itself, so this only adds the per-frame clearance columns and the render overlay
+python src/poc/pipeline1_bev.py --video $V --calibration $S/calibration.json \
+    --car $S/car.json --template $S/sticker.png --template-mm-per-px 9.41 \
+    --rois $S/rules.json --out $S/detect.csv \
+    --corner-pnp --detector-offset
+
+python src/poc/score.py --track $S/detect.csv --rules $S/rules.json \
+    --calibration $S/calibration.json --tyre-width-mm 195 \
+    --out $S/scorecard.json
+```
+
+`rules` seeds the file on its first run and draws whatever is still undrawn on
+every run after, so it can be stopped and resumed; `--redraw` does the ones
+already done, and `--add NAME --type line` appends a region the DSR does not
+name. B7 pulls 18 rules — its own plus `GEN` — and six regions between them:
+`stop_line`, `front_boundary`, `rear_boundary`, `right_line`, `curb` and
+`any_boundary`. Regions are clicked on the raw undistorted frame and read on the
+**field** plane, because paint and kerbs are on the ground, which is why the
+`gcp` still is the right picture to draw them on rather than the one with the car
+parked in the way.
+
+**Finish drawing before pointing the pipeline at the file.** `score.py` skips a
+region with no points; the pipeline's `--rois` does not, and a half-drawn rules
+file fails inside the clearance arithmetic with `ValueError: min() iterable
+argument is empty`, naming no region. Either finish the set, or leave the
+pipeline on a plain `roi.json` — scoring does not need it either way.
+
+`--tyre-width-mm` is what lets a rule ask whether a *tyre* is on a line rather
+than whether its centre point is, and without wheel columns in the track ten of
+the DSR's rules cannot be evaluated at all. `--station` filters the rules to one
+station plus `GEN`; a file seeded by `rules` is already filtered, so it is only
+useful on a hand-merged one.
+
+**A rule this cannot check is reported, never skipped.** Every rule carries a
+`needs` list, and anything missing comes back `BLOCK` with the reason rather than
+quietly passing. A scoring engine that silently passes what it cannot see is
+worse than one that refuses: the score looks complete and is not. On B7's own
+201-frame track:
+
+```
+   skip  B7R2          no reversing phase found on this track
+    ok   B7R3          front_bumper stayed behind front_boundary
+    ok   B7R5          rear_wheels stayed behind rear_boundary
+  BLOCK  B7R6          needs handbrake
+  DEDUCT B7R9     -15  nearest wheel 2039 mm from right_line, 0.6 deg off it (limit 10 deg)
+  manual GENR1         not an image-processing rule
+  BLOCK  GENR4         needs multi_vehicle
+
+  deducted 15 point(s)
+  2 rule(s) could not be checked — the score above is incomplete
+```
+
+Five states, and they mean different things. `ok` and `DEDUCT` are verdicts.
+`skip` is a rule whose precondition never arose — no reversing phase, no stop —
+and is not a pass. `manual` is a rule the DSR marks as not image-processing at
+all. `BLOCK` is the one to read: `handbrake` and `multi_vehicle` are capabilities
+nothing here produces, so those rules are unevaluated and the run summary says so
+every time.
+
 ## The track CSV
 
 One CSV row per processed frame:

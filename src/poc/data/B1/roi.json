@@ -1,0 +1,19 @@
+{
+  "_comment": "pixels are in the UNDISTORTED frame; read on the ground plane",
+  "rois": [
+    {
+      "name": "stop_line",
+      "type": "line",
+      "points_px": [
+        [
+          1609.4959716796875,
+          1163.4847412109375
+        ],
+        [
+          1612.63525390625,
+          863.58642578125
+        ]
+      ]
+    }
+  ]
+}
