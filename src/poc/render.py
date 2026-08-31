@@ -94,7 +94,11 @@ def homography_at_height(K, R, t, height_mm: float):
     return H / H[2, 2]
 
 
-def chip(img, text, org, colour, k, weight=1.0):
+def _overlaps(a, b) -> bool:
+    return not (a[2] <= b[0] or b[2] <= a[0] or a[3] <= b[1] or b[3] <= a[1])
+
+
+def chip(img, text, org, colour, k, weight=1.0, top=0, avoid=()):
     """Text on a solid backing, sized so it survives the final downscale.
 
     Everything is drawn on the full-resolution frame and the whole thing is
@@ -102,21 +106,38 @@ def chip(img, text, org, colour, k, weight=1.0):
     half-size render. Every size here is multiplied by ``k`` for that reason. The
     backing matters as much as the size: an ROI label lands on grass in one frame
     and bright concrete in the next, and a plain stroke disappears into one of them.
+
+    Three things can hide a number that has to be read, and staying inside the
+    frame is only the first. ``top`` is the first row the chip may use: the
+    status bar is painted last, over everything, so a label anchored on a shape
+    near the top edge would otherwise be drawn and then buried — visible in the
+    render as a chip with its top sliced off. ``avoid`` is the rectangles
+    already taken by earlier chips, which a station with two lines a metre apart
+    would otherwise stack into an unreadable pile; the chip walks downwards
+    until it finds clear space, and stays put if it runs out of frame.
+
+    Returns the rectangle it occupied, to be fed back in as ``avoid``.
     """
     scale = 1.0 * k * weight
     thick = max(1, round(2.4 * k * weight))
     (tw, th), base = cv2.getTextSize(text, FONT, scale, thick)
     pad = max(2, round(9 * k))
-    # Keep the chip inside the frame: an ROI near an edge would otherwise have
-    # its number clipped off, which is the one part of it that has to be read.
     H_img, W_img = img.shape[:2]
     x = int(min(max(org[0], pad + 1), W_img - tw - pad - 1))
-    y = int(min(max(org[1], th + pad + 1), H_img - base - pad - 1))
-    cv2.rectangle(img, (x - pad, y - th - pad), (x + tw + pad, y + base + pad), (0, 0, 0), -1)
-    cv2.rectangle(img, (x - pad, y - th - pad), (x + tw + pad, y + base + pad), colour,
-                  max(1, round(2 * k)))
+    y = int(min(max(org[1], top + th + pad + 1), H_img - base - pad - 1))
+    step = th + 2 * pad + max(2, round(4 * k))
+    for _ in range(8):
+        rect = (x - pad, y - th - pad, x + tw + pad, y + base + pad)
+        if not any(_overlaps(rect, r) for r in avoid):
+            break
+        if y + step > H_img - base - pad - 1:
+            break
+        y += step
+    rect = (x - pad, y - th - pad, x + tw + pad, y + base + pad)
+    cv2.rectangle(img, rect[:2], rect[2:], (0, 0, 0), -1)
+    cv2.rectangle(img, rect[:2], rect[2:], colour, max(1, round(2 * k)))
     cv2.putText(img, text, (x, y), FONT, scale, colour, thick, cv2.LINE_AA)
-    return tw + 2 * pad
+    return rect
 
 
 def apply_h(H, pts):
@@ -232,6 +253,9 @@ def main() -> None:
     # of that resize. Without it a 3 px line renders at 1.5 px and the labels are
     # unreadable — which is the whole reason this factor exists.
     k = args.label_scale / max(args.scale, 1e-6)
+    # The status bar is painted last, over everything. Its height is needed
+    # before that, so the ROI labels can be kept out from under it.
+    bar_h = round(40 * k)
     lw = max(2, round(5 * k))
 
     divisor = {"m": 1000.0, "cm": 10.0, "mm": 1.0}[args.units]
@@ -287,6 +311,7 @@ def main() -> None:
         img = cv2.remap(frame, map1, map2, cv2.INTER_LINEAR)
         found = row["found"] == "1"
 
+        labels = []
         for r in rois:
             hit = found and row.get(f"{r['name']}_hit") == "1"
             col = ROI_HIT if hit else ROI_OK
@@ -305,7 +330,7 @@ def main() -> None:
             # anchored on the shape's middle, not its first vertex, which is as
             # likely as not to be under the car or off the edge of the frame
             mid = p.mean(axis=0)
-            chip(img, label, (mid[0] + 14 * k, mid[1] - 14 * k), col, k)
+            labels.append((label, (mid[0] + 14 * k, mid[1] - 14 * k), col))
 
         if found:
             box_mm = np.array([[float(row[f"box{i}_x_mm"]), float(row[f"box{i}_y_mm"])]
@@ -365,7 +390,16 @@ def main() -> None:
                 f"({float(row['sticker_x_mm']) / 1000:+.3f}, {float(row['sticker_y_mm']) / 1000:+.3f}) m  "
                 f"hdg {float(row['heading_deg']):+.1f}°  sigma {float(row['sigma_mm']):.2f} mm"
                 if found else "MISS")
-        bar_h = round(40 * k)
+        # Labels last. The footprint, the wheels and the detection quad are all
+        # drawn over the ROI shapes on purpose — the car is the subject — but a
+        # clearance is a number to be read, not part of the picture, so it goes
+        # on top of the lot. Before this, a box edge crossing a chip struck the
+        # reading through in the frames where the car was closest, which are
+        # exactly the frames anyone reviews.
+        placed = []
+        for label, org, col in labels:
+            placed.append(chip(img, label, org, col, k, top=bar_h, avoid=placed))
+
         cv2.rectangle(img, (0, 0), (W, bar_h), (0, 0, 0), -1)
         cv2.putText(img, bar, (round(14 * k), round(28 * k)), FONT, 0.78 * k,
                     TEXT if found else ROI_HIT, max(1, round(2 * k)), cv2.LINE_AA)

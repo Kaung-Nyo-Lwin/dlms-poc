@@ -11,6 +11,8 @@ nothing imports `dlms`.**
 | `pipeline1_bev.py` | warp each frame to the car plane, then match |
 | `pipeline2_raw.py` | match in the camera frame, then map the centre |
 | `render.py` | draw either pipeline's CSV back onto the video |
+| `traffic_light.py` | read the signal aspect from the camera that faces it |
+| `score.py` | take a track and `dsr_rules.json`, and deduct points |
 
 There are no stations, no vehicle ids and no workspace. Every input and output is
 a path you choose, so a whole site is one directory.
@@ -20,28 +22,56 @@ a path you choose, so a whole site is one directory.
 Run the steps in order; each writes a file the next one reads.
 
 ```sh
-cd src/poc
-S=~/site                      # one folder for everything
+# from the repo root; `python` here means `.venv/bin/python` unless it is activated
+S=poc/B4                      # one folder per station
+V=raw/B4/B4_T2_near.mp4       # the clip this station is surveyed and tracked on
 
-python calibrate.py frame      --video $S/station.mp4 --at 0 --out $S/frame.png
-python calibrate.py intrinsics --video $S/checkerboard.mp4 --board 11x7 --square-mm 30 \
-                               --out $S/intrinsics.json
-python calibrate.py gcp        --image $S/frame.png --intrinsics $S/intrinsics.json \
-                               --out $S/calibration.json
-python calibrate.py measure    --image $S/frame.png --calibration $S/calibration.json
-python calibrate.py tape       --image $S/frame.png --calibration $S/calibration.json
-python calibrate.py carplane   --image $S/frame.png --calibration $S/calibration.json \
-                               --height-mm 1450          # optional, see below
-python calibrate.py sticker    --image $S/frame.png --calibration $S/calibration.json \
-                               --height-mm 1450 --out $S/sticker.png
-python calibrate.py outline    --image $S/frame.png --calibration $S/calibration.json \
-                               --sticker-height-mm 1450 --height-mm 500 \
-                               --length-mm 4700 --width-mm 1800 \
-                               --front-to-wheel-mm 900 --rear-to-wheel-mm 850 \
-                               --out $S/car.json
-python calibrate.py roi        --image $S/frame.png --calibration $S/calibration.json \
-                               --out $S/rois.json
+# The lens belongs to the camera, not to the station: calibrate it once and
+# point every station at the same file.
+python src/poc/calibrate.py intrinsics --video intrinsics/checkerboard.mp4 \
+    --board 11x7 --square-mm 30 --model fisheye \
+    --out intrinsics/test_harvest_fish.json
+
+# Two stills, because the two halves of the survey want different pictures: the
+# ground marks have to be visible for `gcp` and `roi`, and the car has to be
+# parked in the station for `sticker` and `outline`.
+python src/poc/calibrate.py frame --video $V --at 0  --out $S/gcp.png
+python src/poc/calibrate.py frame --video $V --at 22 --out $S/car.png
+
+python src/poc/calibrate.py gcp --image $S/gcp.png \
+    --intrinsics intrinsics/test_harvest_fish.json \
+    --out $S/calibration.json
+
+python src/poc/calibrate.py sticker --image $S/car.png \
+    --calibration $S/calibration.json \
+    --height-mm 1450 --out $S/sticker.png
+
+python src/poc/calibrate.py roi --image $S/gcp.png \
+    --calibration $S/calibration.json --out $S/roi.json
+
+python src/poc/calibrate.py outline --image $S/car.png \
+    --calibration $S/calibration.json \
+    --sticker-height-mm 1450 --front-height-mm 160 --side-height-mm 0 \
+    --length-mm 4630 --width-mm 1730 --side \
+    --marker-corners \
+    --template $S/sticker.png --template-mm-per-px 4.07 \
+    --front-to-wheel-mm 900 --rear-to-wheel-mm 850 --tyre-width-mm 195 \
+    --out $S/car.json
 ```
+
+`sticker` runs before `outline`, because `outline --template` matches the cut
+template against the survey frame to measure the detector offset, and because
+`sticker` is what prints the `--template-mm-per-px` the next two steps need. The
+numbers above are B4's: a 4630 x 1730 mm car, its marker 1450 mm up, bumper
+corners at 160 mm and the sill at ground level.
+
+Two more steps exist and this workflow does not run them. **`measure`** clicks
+two ground points and reads the distance back, for a tape to argue with — the
+`gcp` residuals only say the fit agrees with itself at the marks it was given,
+so this is worth doing before trusting anything downstream. **`carplane`**
+surveys the marker's plane from poles standing on known marks, instead of
+raising `Z` through the camera pose. Both are checks; neither writes anything
+the pipelines require.
 
 Each interactive step prints a `http://127.0.0.1:…` URL and opens it. If your
 browser does not open (common under WSL), pass `--no-open` and click the URL.
@@ -52,10 +82,10 @@ nearest sub-pixel corner — which is most of what makes a painted cross
 repeatable between operators.
 
 There are no pop-up dialogs anywhere. Text goes in one field in the toolbar,
-read only at the moment it is needed: in `roi` it is the optional name for the
-next shape, in `gcp` it is the world `X, Y` you type *before* clicking the mark,
-in `tape` it is the length in millimetres you type before clicking both ends.
-A dialog can be blocked outright in an embedded browser such as VS Code's
+read only at the moment it is needed: in `roi` and `traffic_light.py lamps` it is
+the optional name for the next shape, and in `gcp` it is the world `X, Y` you
+type *before* clicking the mark. A dialog can be blocked outright in an
+embedded browser such as VS Code's
 Simple Browser, and even when it renders it may never take keyboard focus — so
 nothing here is allowed to block on one. Finishing a shape with **p** / **l** /
 **g** (or the toolbar buttons) is always immediate; an unnamed shape gets
@@ -84,67 +114,11 @@ Notes on the steps that have a trap in them:
   points is the minimum and is exactly determined — six or more spread across
   the working area is what makes the residuals mean anything. A residual over
   50 mm is almost always a mistyped coordinate or a click on the wrong mark.
-- **`measure`** — click two ground points, read the distance back, compare with a
-  tape. The `gcp` residuals only say the fit agrees with itself at the marks it
-  was given; this is the number a tape can argue with. Do it before trusting
-  anything downstream.
-- **`tape`** — *the second opinion on scale, from lengths you never surveyed.*
-  Lay a tape between two marks on the tarmac, read the millimetres, click both
-  ends. Neither end needs a world coordinate, which is what makes these cheap
-  enough to lay several of, out where the four ground control points are not.
-  Be blunt about what it can see: with correct GCP coordinates, four points
-  against a six-parameter pose is already over-determined and
-  `solvePnPRefineLM` has the click noise handled — 2 mm rms on synthetic
-  station geometry, where *every* tape-based adjustment made it worse. **A tape
-  is not a fix for a noisy pose.** It is the only fix for a wrong *survey*:
-  coordinates typed off a stretched tape, a mis-paced offset, a transposed
-  digit. Nothing in the image can see that, because the fit is perfectly
-  self-consistent with the wrong answer — `gcp` reports millimetres of residual
-  while the map is centimetres out.
-  So the step **reports and changes nothing** unless you pass `--adjust`, and
-  what it does then depends on whether the tapes agree with each other. If they
-  do, the fault is scale, and it is corrected in closed form as `t -> a*t` —
-  scaling the translation multiplies every ground coordinate by exactly `a` and
-  touches nothing else, so the typed coordinates are scaled to match. If they
-  disagree, the fault has shape, and the pose and *all* the typed coordinates
-  are re-solved together against the tapes. That second part is the whole
-  design: hold the typed coordinates as truth and their reprojection residuals
-  pin the pose completely, so the tapes have nowhere to push and the fit comes
-  back unchanged — a pose-only refinement carrying a tape measured identical to
-  plain `solvePnP` in every error mode tried. `--sigma-world-mm` is therefore
-  the real knob: it is how far the tapes may overrule the survey.
-  Ground-distance rms over an 8x20 m working area, synthetic station geometry:
-
-  | GCP coordinates | 4-pt PnP | rescale | free net, 1 / 2 / 3 tapes |
-  |---|---|---|---|
-  | exact | **2 mm** | 14 mm | 14 / 10 / 8 mm |
-  | 0.5% scale error | 50 mm | **14 mm** | 37 / 30 / 31 mm |
-  | 30 mm random | 100 mm | 75 mm | 59 / 46 / **26 mm** |
-
-  Read the first row before reaching for `--adjust`: when the survey is already
-  right, adjusting costs a factor of seven, which is why the gate refuses when
-  no tape is more than `--gate-z` sigma out. Read the last: three tapes is
-  where the free network starts winning consistently. **Lay them long** — a
-  tape's noise divides by its length, so one 10 m tape is worth nine 3 m ones,
-  and length is free where a fourth tape is not.
-  Two refusals guard it, and neither is "the correction was large": a survey
-  wrong by 30 mm at the marks is legitimately hundreds of millimetres wrong out
-  where nothing was surveyed, so capping the movement would reject exactly the
-  corrections worth making. What a blunder looks like is a tape still not
-  fitting once the fit has had every chance (`--max-bar-z`), or a mark dragged
-  further than a survey could plausibly be wrong (`--max-gcp-move-sigma`). A
-  transposed digit in a length, a click on the wrong mark, and a mistyped
-  ground control coordinate are each caught and named.
-  Adjusting rewrites the pose, so it re-fits the surveyed `car` plane from its
-  stored pole tops — leaving that stale is the one outcome that must not
-  happen, since both pipelines prefer it and nothing downstream can tell it
-  disagrees with the ground beneath it. **`car.json` is stale too** and the step
-  says so: its `body_polygon_mm` came from clicks through the old plane. Re-run
-  `outline`.
-  A tape cannot tell "the pose is wrong" from "the ground is not flat here". On
-  a sloped pad one laid across the fall reads long, and `--adjust` will bend the
-  pose to absorb a non-planarity no pose can represent. That is the argument for
-  leaving the check as the default.
+  **Four coplanar points cannot check themselves**: they determine the
+  homography exactly, so the residual measures click jitter and nothing else,
+  and it says the same thing on a flat pad and on a slope. Spread them over the
+  area the car will actually occupy — a plane fitted to a 2 m square and
+  extrapolated 5 m out is extrapolation, whatever the residual says.
 - **`carplane`** — *optional, and the one step that measures rather than assumes.*
   Every other path to the marker's plane raises `Z` through the camera pose,
   which is exact only if the pose is. This stands poles at marker height over
@@ -196,6 +170,42 @@ Notes on the steps that have a trap in them:
   implies (`error = gap * r / width`) rather than as millimetres of width, and
   solves back for the height the clicks actually imply — an 88 mm width gap is
   300 mm of box, which is why a raw width threshold is the wrong unit.
+  **The front edge and the flank need not sit at the same height.** A bumper
+  corner is near 500 mm, a sill runs lower, a shoulder crease higher — and
+  clicking one on the other's plane displaces it. `--front-height-mm` and
+  `--side-height-mm` give each line its own raster; both default to
+  `--height-mm`, so a command that does not use them behaves exactly as before.
+  Nothing needs reconciling afterwards, which is the part worth understanding: a
+  raster rectified to height `p` reports where a ray crosses `p`, so a feature
+  *at* `p` reads its true horizontal position. Marker, front edge and flank
+  therefore arrive as the same world millimetres on the same ground whatever
+  heights they were read at, and compose directly. On a synthetic car with
+  bumpers at 500 mm and a sill at 300 mm, per-plane clicking returns the box to
+  **0.00 mm**; forcing both onto one plane costs 22 mm at 500, 347 mm at 300 and
+  589 mm at 160.
+  The two mistakes are not equally bad, and provably so. A homology maps a line
+  to a *parallel* line, so the direction the flank gives is exact however wrong
+  `--side-height-mm` is — 0.000000° over a 600 mm error in testing. All that
+  moves is where the flank sits across the car, and the step prints how much per
+  10 mm for the geometry in front of it. `--front-height-mm` is the one that
+  costs about a millimetre per millimetre, and the width check is what sees it.
+  Three levels also make a question askable that two could not answer: how far
+  the marker sits from the flank, against half of `--width-mm`. What is left
+  over is the marker's own offset from the centreline plus, when the planes
+  differ, the body's taper between them — two causes in one number, so it is
+  quoted and never corrected.
+  Each overlay in the approval view is drawn on the plane that makes it mean
+  something. The clicked lines go back on their own levels, where they still
+  land on the clicks that made them; **the box is drawn on the lowest of the
+  three**. Its corners are horizontal positions carrying no height of their own,
+  so putting them on an image is a choice — and the lowest level sets the
+  outline on the car's base instead of up at bumper height, where it would stand
+  proud of it by exactly the parallax this step exists to remove. The gap you
+  see between the box and the front line *is* that parallax. Nothing written
+  changes: it moves an overlay, not a millimetre. When the overlays end up on
+  different planes the check moves onto the frame, since a flank drawn on the
+  front plane's bird's-eye lands where it appears from there rather than where
+  it was clicked.
   Nothing is written until you approve it: the step shows the adjusted line and
   the resulting box as two toggleable overlays with the raw clicks marked, and
   cancelling that view re-runs the clicks. `--no-preview` skips the check. **`--height-mm` is the number that matters**: a
@@ -210,29 +220,39 @@ Notes on the steps that have a trap in them:
   with the car and tracks it perfectly — it never announces itself, and the
   squareness check cannot see it. **Compare the printed box against the car's
   real length and width; that is the only place a wrong height shows up.**
-  **Wheels** come from `--wheelbase-mm`, `--track-mm` and `--front-overhang-mm`,
-  all three or none. They are not clicked: an oblique camera shows the near
-  side behind the sill and the far side under the body, so the contact patches
-  are constructed off the box's own axes instead. That also retires the `car`
-  step's guess that the two overhangs are equal — a front-drive hatchback's
-  front overhang runs 100-150 mm longer, which put each axle 50-75 mm out.
-  `--check-wheels` opens a **ground-plane** raster to click whatever patches
-  are visible and reports how far each is from the constructed one; that is the
-  only independent word on whether the three tape numbers are right.
+  **Wheels** come from `--front-to-wheel-mm` and `--rear-to-wheel-mm` — the
+  clicked front line back to the front axle, and the box's rear line forward to
+  the rear axle — both or neither, plus an optional `--track-mm`. They are not
+  clicked: an oblique camera shows the near side behind the sill and the far
+  side under the body, so the contact patches are constructed off the box's own
+  axes instead. Measuring each end separately retires the `car` step's guess
+  that the two overhangs are equal — a front-drive hatchback's front overhang
+  runs 100-150 mm longer, which put each axle 50-75 mm out. Leave `--track-mm`
+  off and the wheels default to the body width, which puts each one 75-125 mm
+  too far out. `--check-wheels` opens a **ground-plane** raster to click
+  whatever patches are visible and reports how far each is from the constructed
+  one; that is the only independent word on whether the tape numbers are right.
   `--tyre-width-mm` lets a rule ask whether a *tyre* is on a line rather than
   whether its centre point is. Without wheels, ten of the DSR's rules score as
   not-evaluated.
-- **`car`** — the older tape-measured route to the same file. Prefer `outline`.
+  **`--marker-corners`** changes how the marker centre is found: click its four
+  corners and cross the diagonals, rather than clicking the centre directly. A
+  corner is the one place on a marker the sub-pixel snap has something to catch;
+  the middle of a printed disc is not, and everything the step stores is an
+  offset from that point. It costs three extra clicks and turns the centre into
+  a measurement with a residual — for a parallelogram the diagonals' crossing
+  and the mean of the four corners are the same point, and the gap between them
+  is printed and gated by `--max-centre-spread-mm`.
+  **`--space frame`** clicks the box lines on the camera frame at native
+  resolution instead of on a bird's-eye raster, which is the better view when
+  the edge is easier to judge across the plane than down at it.
 - **`sticker`** — click roughly where the marker is, then box it on the bird's-eye
   raster that appears. The box readout is in millimetres, so you can check it
   against the printed marker before committing. The step prints the
   `--template-mm-per-px` value the pipelines need (also in `sticker.json`).
-- **`car`** — lengths come from a tape, orientation from two clicks: the marker
-  centre, then the centre of the front bumper. That second click is the whole
-  point of the step. Stored geometry is in the *sticker template's* frame, not
-  the car's, and a marker printed across the roof rather than along it sits at
-  ±90° to the car. Typing that number in is easy to get backwards; clicking the
-  nose is not.
+- **`car`** — the older tape-measured route to the same file: lengths off a
+  tape, orientation from two clicks. `outline` supersedes it and this workflow
+  does not use it.
 - **`roi`** — click points, then **p** point · **l** line · **g** polygon to
   finish each shape and name it.
 
@@ -244,16 +264,44 @@ and the frames the pipelines undistort all share one coordinate frame.
 ## 2. Track
 
 ```sh
-python pipeline1_bev.py --video $S/station.mp4 --calibration $S/calibration.json \
-    --car $S/car.json --template $S/sticker.png --template-mm-per-px 4.79 \
-    --rois $S/rois.json --out $S/track.csv
+python src/poc/pipeline1_bev.py --video $V --calibration $S/calibration.json \
+    --car $S/car.json --template $S/sticker.png --template-mm-per-px 4.07 \
+    --rois $S/roi.json --out $S/detect.csv \
+    --start 0:22 --end 0:23 \
+    --corner-pnp --detector-offset
 
-python render.py --video $S/station.mp4 --calibration $S/calibration.json \
-    --csv $S/track.csv --rois $S/rois.json --out $S/track.mp4
+python src/poc/render.py --video $V --calibration $S/calibration.json \
+    --csv $S/detect.csv --rois $S/roi.json \
+    --start 0:22 --end 0:23 --units cm --out $S/B4.mp4
 ```
+
+**`--corner-pnp` and `--detector-offset` are both on here on purpose**, and each
+removes a bias that no amount of averaging will: the marker's tilt, and a
+template cut off-centre. Both are explained below, and both are off by default
+because each has a precondition — `--corner-pnp` wants the marker ~60 px across,
+`--detector-offset` wants `outline --template` to have measured an offset to
+read back.
 
 `pipeline2_raw.py` takes the same flags, plus `--ref-mm X,Y` to choose where its
 camera-frame crop is synthesised.
+
+**Changing the car or the ROIs does not need a re-detect.** Detection is the
+expensive half and none of it depends on the car's geometry or on where the
+lines are painted — the CSV already carries where the marker was and which way
+it was turned, so a new `car.json` is a rigid transform of the stored polygon by
+that pose, and a new `roi.json` is a re-measure of the clearance columns.
+`tools/rebox.py` does that, in place:
+
+```sh
+python tools/rebox.py --csv $S/detect.csv --out $S/detect.csv \
+    --car $S/car.json --rois $S/roi.json \
+    --calibration $S/calibration.json --detector-offset
+```
+
+It is a scratch helper and lives outside this folder deliberately: the pipelines
+stay the only thing that turns a video into a track. Note that a track written
+with `--corner-pnp` carries a tilted box, and rebox rebuilds it flat — the
+`plane_fit` column says which rows those are, and it warns when it rewrites any.
 
 `render.py` draws on the full-resolution frame and resizes once at the end, so
 line widths and text are pre-multiplied by the inverse of `--scale`. If the
@@ -265,7 +313,133 @@ Useful on both: `--start` / `--end` to clip, `--every N` to subsample,
 `--margin-mm` to size the search area, and on pipeline 1 `--mm-per-px` for the
 raster resolution and `--search-px` for the tracking window.
 
-## Output
+`--start` and `--end` read seconds, `m:ss` or `h:mm:ss` — the same formats
+`render.py` takes, because a clip is nearly always something that was watched
+on a scrubber first. `--start` **seeks** rather than decoding up to the mark, so
+a late clip costs no more than an early one: on a 61 s 4K file, starting at 55 s
+saved 13.8 s of pure decode, and the saving grows with the video. Where the seek
+lands is read back from the file rather than computed from the request, since
+h264 seeks to a keyframe and a guessed frame index would mislabel every row with
+nothing to show for it. `--end` stops the loop instead of skipping to the end.
+
+`--detector-offset` corrects for a template cut off-centre. The matcher reports
+the *template's* centre, and every box, wheel and clearance hangs off that — so
+a template cut a few pixels out of true puts the whole footprint beside the car,
+consistently, in a way no residual can show. `calibrate.py outline --template`
+measures the gap on the survey frame and stores it as `detector_offset_mm`;
+until now nothing read it back. That search runs at **full resolution**: the
+coarse pyramid the runtime uses to find a marker cold is the wrong tool for a
+one-shot survey match, and on B1's own frame it locked onto the wall of tyres
+behind the car (0.681) in preference to the marker sitting dead centre in the
+raster (0.816), reported no match, and silently left the offset unmeasured. A
+match landing further from the clicked marker than the template is wide is now
+refused rather than stored — that is a lock onto something else, not a template
+cut off-centre, and storing one would add a metre of offset to every frame. With no value the flag uses that measurement,
+or pass `X,Y` in millimetres to give one directly. It is applied **in the
+template's frame**, un-rotated on load by the heading the detector reported when
+it was measured and re-rotated by the heading found in each frame — a
+world-frame constant would be right only at the pose it was surveyed at and
+would swing the wrong way as the car turned. Measured on C6, whose template is
+15.8 mm off centre: the footprint moves 15.8 mm, rigidly, with the heading
+unchanged.
+
+## 3. The traffic light
+
+B8/C7 is the signal station, and its 35-point rule — "Running a red light (whole
+car passes)" — needs two facts that live in different places: *when* the car
+crossed the line, which the tracking above already gives to the frame, and *what
+the signal was showing then*, which nothing else here reads.
+
+The signal does not move and the camera does not move, so there is no search and
+no pose. A lamp is a fixed box, surveyed once, and the whole decision is a colour
+statistic inside it.
+
+```sh
+python src/poc/traffic_light.py lamps --image $S/signal.png --out $S/lamps.json
+
+python src/poc/traffic_light.py video --video $S/signal.mp4 \
+    --lamps $S/lamps.json --out $S/spans.csv
+```
+
+`lamps` is one picker session: draw a shape round each lens and name it `red`,
+`amber` or `green`, and the names become the aspects — the bounding box is what
+is stored, so a rough polygon round a round lens is fine. Draw *inside* the lens
+rather than round the housing: the response is a fraction of the box, so every
+pixel of black rim in it drags a lit lamp toward the floor for nothing.
+
+Lamp boxes are stored in **raw camera pixels**, which is the one place this
+folder does not use the undistorted frame. Nothing here measures geometry — no
+coordinate leaves the file and no lamp box is ever compared against an ROI or a
+car box — so undistorting would cost a full-frame remap per frame, and make the
+signal camera need intrinsics it may not have, to move a box that is read in its
+own frame either way.
+
+`video` writes `t_start_s, t_end_s, aspect, frames` after a debounce, since
+signals hold for seconds and a one-frame flip is a bulb flicker or a passing
+roof. The span opens at the **first** frame of the run that settled it, not the
+last: charging the debounce to the timestamp would put every transition three
+frames late, which is a metre of road at 30 km/h in the one measurement where a
+metre decides a 35-point fault. Spans are half-open, so one ends exactly where
+the next begins and a moment on the boundary belongs to the *new* aspect —
+`aspect_at(spans, t)` is what a rule calls at the crossing time.
+
+A lit lamp is *coloured* and an unlit one is dark grey behind a tinted lens, so a
+pixel counts when its **chroma** — `max(R,G,B) - min(R,G,B)` — clears a floor and
+its hue is in that lamp's band. Chroma rather than HSV's S channel, and that is
+not a detail: S is `(max-min)/max`, so it *rises* as a pixel goes dark, and the
+unlit lenses in the reference picture sit at S = 59..96 with V = 21..34 — an S
+floor alone calls them saturated. Their chroma is 6..10 against 101..176 for the
+lit ones. Then the aspects are **ranked**, and the winner must clear a floor
+*and* beat the runner-up; an amber responding half as strongly as the red beside
+it is a bounce off a wet road. Anything short of a clear win is `unknown`, which
+`score.py` must render as "not evaluated" and never as "no fault".
+
+### Calibrating it for a site
+
+The bands in `DEFAULT_SPEC` were measured on `roi/traffic_light.jpg`, a stock
+photograph of three heads — **not this site's lamps**. `split` cuts a picture
+like that into one still per aspect, and `check` scores them:
+
+```sh
+python src/poc/traffic_light.py split --image roi/traffic_light.jpg \
+    --lit red,amber,green --out roi
+
+python src/poc/traffic_light.py check --lamps roi/traffic_light.lamps.json \
+    roi/traffic_light_red.png roi/traffic_light_amber.png roi/traffic_light_green.png
+```
+
+| aspect | hue p5..p95 | chroma p50 | response | the same box, unlit |
+|---|---|---|---|---|
+| red | 173..179 | 176 | 0.931 | chroma p50 6 |
+| amber | 6..22 | 156 | 0.652 | chroma p50 10 |
+| green | 81..85 | 101 | 0.780 | chroma p50 8 |
+
+3/3, each lit lamp winning its own aspect by 0.65 or better against a floor of
+0.10, with the two unlit boxes beside it at 0.000 every time. That says the rule
+works. It does not say the bands fit a site — LED matrices at forty metres
+through a wet windscreen are not a studio shot of a lens — so `check` prints the
+hue and chroma it measured, and a still of each aspect lit *here* is read the
+same way. Put the result in `lamps.json`'s `spec` block, which is where a site's
+own bands belong: they are a property of these lamps under this camera, exactly
+as the boxes are, and splitting the two across separate files is how a site ends
+up scored with another site's numbers.
+
+Amber's 0.652 is the red/amber band edge and is worth reading: 92.6% of that
+lamp is coloured, but 29.5% of it falls below hue 11, outside amber's band, and
+is charged to nobody. A box only ever answers for its own colour, so hue outside
+a band is *lost* and never awarded to the aspect next door — the edge can cost a
+lit lamp response and can never invent one. The known failure is the opposite
+one: a close LED that clips to white has no chroma at its core and reads as
+unlit, and `--chroma-min` is the knob for it.
+
+**The unfinished part is the clock.** The signal camera and the tracking camera
+are separate streams, and an unreconciled offset is the whole risk here: a car at
+30 km/h covers 8 metres in a second, so a clock a second out puts the crossing on
+the wrong side of the change with nothing downstream to show it. Record both
+against one wall clock at capture, or fix the offset once off an event visible to
+both — the signal itself changing, if it is in both fields of view.
+
+## The track CSV
 
 One CSV row per processed frame:
 
@@ -290,10 +464,26 @@ the detection box on the marker, **red cross** the ground point beneath it,
 **purple** the heading. ROI shapes are amber when clear and red when the car
 box is touching or crossing them.
 
-`<roi>_mm` is the gap between the car box and that ROI: `0.0` when they cross,
-negative when the ROI lies wholly under the car. `<roi>_hit` is the boolean a
-rule actually asks — kept separate so a clearance of `0.0` is never mistaken for
-a near miss that rounded down. Pipeline 2 appends `scale`, `expected_scale` and
+`<roi>_mm` is the gap between the car box and that ROI, negative when the ROI
+lies wholly under the car and otherwise the shortest distance between the two
+outlines. `<roi>_hit` is the boolean a rule actually asks — kept separate so a
+clearance of `0.0` is never mistaken for a near miss that rounded down.
+
+**A line the box straddles reads negative**, and its size is how far the box
+would have to move to come off that line. Zero is the honest answer to "how far
+apart are they" the moment two outlines touch, and it stays zero however far the
+car drives on — so a graze and a bumper 800 mm over a boundary used to render
+alike, both `+0.00 m`. The shortest distance that still means something once
+they overlap is the shortest one that *separates* them: push the box
+perpendicular to the line until every corner is on one side, whichever side is
+cheaper. A car halfway across a line reads half its own length.
+
+Polygons keep their `0.0` on crossing. A closed shape has an inside, so how far
+a car has intruded into a region is a different question from how far it has
+crossed a boundary, and it is not the one this column answers. Every scoring
+threshold is a monotone test on this number (`gap <= min_mm`, `gap > max_mm`)
+and every one of them is non-negative, so the lines going negative leaves every
+rule's verdict exactly as it was. Pipeline 2 appends `scale`, `expected_scale` and
 `scale_ratio`; `render.py` ignores columns it does not know, so it reads either.
 
 ## The two things worth understanding
@@ -350,6 +540,21 @@ pipelines print the marker's pixel size and warn when it is under the limit.
 Frames where the fit does not converge fall back to the planar read, and the
 `plane_fit` column records which was used per frame, alongside `pitch_deg` and
 `roll_deg`.
+
+**Check `plane_fit` rather than the banner.** The startup line says the flag is
+on and the marker is big enough; it does not say the fit ran. The fallback is
+silent by design — a frame the corners cannot be fitted on should degrade to the
+old number rather than to no number — which also means a fit that never
+converges looks exactly like one that always does. `plane_fit` is the only place
+that distinguishes them, and a column of `planar` with the flag on is the thing
+to notice. On B4's `B4_T2_near.mp4`, 22-23 s, all 21 frames come back
+`corner-pnp` at pitch +0.20° and roll -0.47°, moving the footprint 16 mm from
+where the planar read put it.
+
+It is not free: the eight-parameter ECC runs up to 200 iterations on top of the
+Euclidean one that seeded it, and on those same 21 B4 frames the run went from
+0.65 to 2.5 s per frame. That is the cost of the measurement, not overhead —
+budget for roughly double the detection time when it is on.
 
 Pipeline 1's numbers above are measured. Pipeline 2 carries the same code path
 but is **not yet validated the same way** — the synthetic harness for it is not

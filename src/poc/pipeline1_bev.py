@@ -108,6 +108,58 @@ def homography_at_height(K: np.ndarray, R: np.ndarray, t: np.ndarray, height_mm:
     return H / H[2, 2]
 
 
+#: What ``--detector-offset`` stores when given with no value: read the offset
+#: `outline` measured out of the car file rather than taking one off the CLI.
+USE_CAR_FILE = "<car file>"
+
+
+def parse_time(text):
+    """Seconds from "130", "2:10" or "1:02:03". None passes through.
+
+    Colons because that is how anyone reads a time off a player's scrubber, and
+    a clip is nearly always something that was watched first.
+    """
+    if text is None:
+        return None
+    parts = str(text).strip().split(":")
+    if len(parts) > 3:
+        raise SystemExit(f"cannot read {text!r} as a time; use s, m:ss or h:mm:ss")
+    total = 0.0
+    try:
+        for part in parts:
+            total = total * 60.0 + float(part)
+    except ValueError:
+        raise SystemExit(f"cannot read {text!r} as a time; use s, m:ss or h:mm:ss") from None
+    return total
+
+
+def detector_offset(arg, car):
+    """The correction to add to every detected centre, in the template's frame.
+
+    ``None`` when the option was not given, which leaves the old behaviour: the
+    detector's own centre is used as the marker's.
+    """
+    if arg is None:
+        return None
+    if arg == USE_CAR_FILE:
+        off = car.get("detector_offset_mm")
+        if off is None:
+            raise SystemExit(
+                "--detector-offset with no value reads detector_offset_mm from the car "
+                "file, and this one has none. `calibrate.py outline --template ... "
+                "--template-mm-per-px ...` measures it, or pass X,Y in millimetres here.")
+        return off
+    parts = str(arg).split(",")
+    try:
+        if len(parts) != 2:
+            raise ValueError
+        return np.array([float(v) for v in parts], dtype=np.float64)
+    except ValueError:
+        raise SystemExit(
+            f"cannot read {arg!r} as an offset; give X,Y in millimetres, or no value at "
+            "all to use the car file's own measurement") from None
+
+
 def load_car(path: Path) -> dict:
     """Vehicle geometry, in the *sticker template* frame.
 
@@ -138,7 +190,23 @@ def load_car(path: Path) -> dict:
     if wheels:
         wheels = {k: np.array([v["x_mm"], v["y_mm"]], dtype=np.float64)
                   for k, v in wheels.items()}
+
+    # The template's own centre is not always the marker's: cut it a few pixels
+    # off and every box hangs off a point beside the car. `outline --template`
+    # runs this same matcher on the survey frame and records the gap it found.
+    # It is a property of how the template was cut, so it is fixed in the
+    # template's frame and turns with the car — which is why it is un-rotated
+    # here by the heading the detector reported when it was measured, instead of
+    # being kept as the world-frame vector it was measured as. Stored at one
+    # pose and applied at another, the difference is the whole offset.
+    off = raw.get("detector_offset_mm")
+    det_offset = None
+    if off:
+        ang = -math.radians(float(raw.get("detector_heading_deg") or 0.0))
+        c, s_ = math.cos(ang), math.sin(ang)
+        det_offset = np.array([[c, -s_], [s_, c]]) @ np.array([off["x_mm"], off["y_mm"]])
     return {
+        "detector_offset_mm": det_offset,
         "car_id": str(raw.get("car_id", "car")),
         "body_mm": body,
         "yaw_offset_deg": yaw,
@@ -406,13 +474,43 @@ def _inside(poly, p) -> bool:
     return cv2.pointPolygonTest(poly.astype(np.float32), (float(p[0]), float(p[1])), False) >= 0
 
 
+def line_penetration_mm(box, a, b) -> float:
+    """How far the box would have to move to get off the line through ``a``-``b``.
+
+    The shortest distance between two outlines that cross is zero, and it stays
+    zero however far the car drives on — so a graze and a bumper 800 mm over a
+    boundary read alike. The shortest distance that *means* something once they
+    overlap is the shortest one that separates them: push the box perpendicular
+    to the line until every corner is on one side, whichever side is cheaper.
+
+    Only ever asked of an open line. A closed shape has an inside, so "which
+    side" is not a question with two answers, and its zero is left alone.
+    """
+    e = np.asarray(b, dtype=np.float64) - np.asarray(a, dtype=np.float64)
+    n = np.array([-e[1], e[0]])
+    ln = float(np.linalg.norm(n))
+    if ln < 1e-9:
+        return 0.0
+    d = (np.asarray(box, dtype=np.float64) - np.asarray(a, dtype=np.float64)) @ (n / ln)
+    # Deepest corner either side; the cheaper push is the shallower of the two.
+    return float(min(max(d.max(), 0.0), max(-d.min(), 0.0)))
+
+
 def clearance_mm(box, roi_pts, closed) -> tuple[float, bool]:
     """Gap between the car box and one ROI, in millimetres.
 
-    Zero when they cross, negative when the ROI lies wholly under the car, and
-    otherwise the shortest distance between the two outlines. The boolean is the
-    thing a rule actually asks — "is the car on it?" — kept separate so a
-    clearance of 0.0 is never confused with a near miss rounded down.
+    Negative when the ROI lies wholly under the car, and otherwise the shortest
+    distance between the two outlines. The boolean is the thing a rule actually
+    asks — "is the car on it?" — kept separate so a clearance of 0.0 is never
+    confused with a near miss rounded down.
+
+    An **open line** the box straddles is the one case where zero is not the
+    useful answer, because the distance between the outlines is zero from the
+    moment they touch and says nothing about how far the car went on. There the
+    gap is negative and its size is how far the box would have to move to come
+    off the line — see :func:`line_penetration_mm`. Polygons keep their zero:
+    a closed shape has an inside, and how far a car has intruded into a region
+    is a different question from how far it has crossed a boundary.
     """
     roi = np.asarray(roi_pts, dtype=np.float64).reshape(-1, 2)
     edges = [(box[i], box[(i + 1) % 4]) for i in range(4)]
@@ -421,10 +519,15 @@ def clearance_mm(box, roi_pts, closed) -> tuple[float, bool]:
         n = len(roi) if closed else len(roi) - 1
         roi_segs = [(roi[i], roi[(i + 1) % len(roi)]) for i in range(n)]
 
-    for a, b in edges:
-        for c, d in roi_segs:
-            if _segments_cross(a, b, c, d):
-                return 0.0, True
+    crossed = [(c, d) for a, b in edges for c, d in roi_segs
+               if _segments_cross(a, b, c, d)]
+    if crossed:
+        if closed:
+            return 0.0, True
+        # The deepest of the crossed segments: a polyline can clip a corner with
+        # one segment and run under the whole car with the next, and the run is
+        # the one worth reporting.
+        return -max(line_penetration_mm(box, c, d) for c, d in crossed), True
 
     best = min(_seg_dist(p, a, b) for p in roi for a, b in edges)
     if roi_segs:
@@ -598,8 +701,16 @@ class HybridDetector:
 
         Returns the corners in the template's own order — the one
         :func:`sticker_quad` uses — or None if the fit does not converge.
+
+        Takes the **raw** raster and preprocesses it here, exactly as
+        :meth:`detect` does, so the two public entry points agree about what
+        they are handed. That is not tidiness: ``findTransformECC`` asserts that
+        its two images have the same channel count, and a colour raster reaching
+        it raises `cv2.error` — which the handler below cannot tell from a
+        genuine convergence failure, so every frame would silently fall back to
+        the planar read with the flag apparently on.
         """
-        got = self._patch(frame, x, y, theta)
+        got = self._patch(preprocess(frame), x, y, theta)
         if got is None:
             return None
         patch, canvas, m, M, geom, _cs = got
@@ -713,8 +824,17 @@ def main() -> None:
     ap.add_argument("--margin-mm", type=float, default=5000.0, help="Raster margin around the ROIs.")
     ap.add_argument("--roi-distorted", action="store_true", help="ROI pixels were clicked on the raw frame.")
     ap.add_argument("--every", type=int, default=1, help="Process every Nth frame.")
-    ap.add_argument("--start", type=float, default=0.0)
-    ap.add_argument("--end", type=float, default=None)
+    ap.add_argument("--start", default=None,
+                    help="Skip to this point before tracking: seconds, m:ss or h:mm:ss. "
+                         "The video is sought rather than decoded up to, so a late clip "
+                         "costs no more than an early one.")
+    ap.add_argument("--end", default=None, help="Stop here. Same formats.")
+    ap.add_argument("--detector-offset", nargs="?", const=USE_CAR_FILE, default=None,
+                    metavar="X,Y",
+                    help="Correct for a template cut off-centre. With no value, use the "
+                         "detector_offset_mm `outline --template` measured; or give X,Y in "
+                         "millimetres. Applied in the template's frame, so it turns with "
+                         "the car.")
     ap.add_argument("--min-score", type=float, default=0.45)
     ap.add_argument("--search-px", type=float, default=140.0, help="Local search radius once tracking.")
     ap.add_argument("--corner-pnp", action="store_true",
@@ -795,6 +915,21 @@ def main() -> None:
     if not cap.isOpened():
         raise SystemExit(f"could not open {args.video}")
     fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+    t_start = parse_time(args.start) or 0.0
+    t_end = parse_time(args.end)
+    if t_end is not None and t_end <= t_start:
+        raise SystemExit(f"--end {args.end} is not after --start {args.start or 0}")
+    det_offset = detector_offset(args.detector_offset, car)
+
+    # Seek rather than decode-and-discard. At 4K a frame costs ~14 ms to decode,
+    # so starting five minutes in would otherwise burn two minutes before the
+    # first row. Where the seek actually lands is read back rather than assumed:
+    # h264 seeks to a keyframe, and a frame index guessed from the request would
+    # mislabel every row in the file with no way to notice.
+    first = 0
+    if t_start > 0:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, int(t_start * fps))
+        first = round(cap.get(cv2.CAP_PROP_POS_FRAMES))
 
     print("pipeline 1 — bird's-eye first", flush=True)
     print(f"  plane      {plane_note}", flush=True)
@@ -809,6 +944,14 @@ def main() -> None:
                   f"testing, which moves the footprint the wrong way. Either raise "
                   f"--mm-per-px, or use a bigger marker, or leave --corner-pnp off.",
                   flush=True)
+    if det_offset is not None:
+        src = "car file" if args.detector_offset == USE_CAR_FILE else "command line"
+        print(f"  det-offset ({det_offset[0]:+.1f}, {det_offset[1]:+.1f}) mm from the {src}, "
+              f"{float(np.linalg.norm(det_offset)):.1f} mm, in the template's frame", flush=True)
+    if t_start > 0 or t_end is not None:
+        print(f"  clip       {t_start:.2f}s to "
+              f"{'end' if t_end is None else f'{t_end:.2f}s'}"
+              f"{f', sought to frame {first}' if first else ''}", flush=True)
     print(f"  rois       {', '.join(r['name'] for r in rois)}", flush=True)
 
     header = (["frame", "time_s", "found", "method", "score", "sigma_mm",
@@ -825,14 +968,16 @@ def main() -> None:
     with open(args.out, "w", newline="") as fh:
         w = csv.writer(fh)
         w.writerow(header)
-        idx = -1
+        idx = first - 1
         while True:
             ok, frame = cap.read()
             if not ok:
                 break
             idx += 1
             t = idx / fps
-            if idx % args.every or t < args.start or (args.end is not None and t > args.end):
+            if t_end is not None and t > t_end:
+                break               # past the clip; nothing later can be wanted
+            if idx % args.every or t < t_start:
                 continue
             n += 1
 
@@ -854,6 +999,13 @@ def main() -> None:
             # The raster flips Y, so read the heading off two mapped points
             # rather than trusting the angle's sign through the flip.
             tpl_heading = math.degrees(math.atan2(*(tip - centre)[::-1]))
+            if det_offset is not None:
+                # Applied here, before the box, the quad, the wheels and the
+                # reported position are built, so all five agree about where the
+                # marker is instead of four of them agreeing with the template.
+                ang = math.radians(tpl_heading)
+                c_, s_ = math.cos(ang), math.sin(ang)
+                centre = centre + np.array([[c_, -s_], [s_, c_]]) @ det_offset
             box, heading = car_box(car["body_mm"], centre, tpl_heading, car["yaw_offset_deg"])
             quad = sticker_quad(centre, tpl_heading, tpl_w_mm, tpl_h_mm)
             pitch = roll = None

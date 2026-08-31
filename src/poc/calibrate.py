@@ -1695,7 +1695,25 @@ def detector_centre(und, H_plane, near_mm, template, template_mm_per_px, y_up=Tr
 
     mm = float(template_mm_per_px)
     raster, _w2b, b2w = bev_around(und, H_plane, near_mm, span_mm, mm, y_up=y_up)
-    got = runtime.HybridDetector(template, min_score=min_score).detect(raster)
+    det = runtime.HybridDetector(template, min_score=min_score)
+
+    # No pyramid here, and the reason is worth keeping. The runtime searches a
+    # whole raster every frame, so it starts coarse: the template is decimated
+    # to `pyr` and swept, then refined where that lands. At a 112x106 px marker
+    # `pyr` is 8, which searches with a 14x13 px patch masked to a 5 px radius —
+    # and at that resolution a marker is a blob among blobs. Measured on B1's
+    # own frame, the row of tyres stacked on the wall behind the car scored
+    # 0.681 against the marker's own peak, so the fine stage refined around a
+    # tyre 2.6 m away, fell under min_score, and this returned "no match" with
+    # the marker sitting dead centre in the raster at 0.816.
+    #
+    # The runtime can afford that gamble: it pays it once, on the cold frame,
+    # and every frame after has a prior that pins the search. Here there is no
+    # second chance and nothing to be fast about — one frame, one small raster,
+    # and an operator who has already clicked the marker. So the sweep runs at
+    # full resolution, which found it at every span tried.
+    det.pyr = 1
+    got = det.detect(raster)
     if got is None:
         return None, None, None
     x, y, theta, score, _sigma, _method = got
@@ -1859,9 +1877,48 @@ def cmd_outline(a) -> None:
     is where it shows; the step reports the gap as the box error it implies and
     solves back for the height the clicks really mean.
 
-    Both are shown for approval before anything is written — one toggle for the
-    front line, one for the box, with the raw clicks marked so an adjustment is
-    visible. Cancelling that view re-runs the clicks; ``--no-preview`` skips it.
+    **The front edge and the flank need not sit at the same height.** A bumper
+    corner is near 500 mm, a sill runs lower, a shoulder crease higher, and
+    clicking one on the other's plane displaces it. ``--front-height-mm`` and
+    ``--side-height-mm`` give each line its own raster; both default to
+    ``--height-mm``, so a command that does not use them is unchanged.
+
+    Nothing has to be reconciled afterwards, which is the part worth
+    understanding. A raster rectified to height ``p`` reports where a ray
+    crosses ``p``, so a feature *at* ``p`` reads its true horizontal position —
+    and marker, front edge and flank therefore arrive as the same world
+    millimetres on the same ground, whatever heights they were read at. They
+    compose directly. Measured on a synthetic car with bumpers at 500 mm and a
+    sill at 300 mm, per-plane clicking returns the box to **0.00 mm**; forcing
+    both onto one plane costs 22 mm at 500, 347 mm at 300 and 589 mm at 160.
+
+    A wrong ``--side-height-mm`` is the milder of the two mistakes, and provably
+    so: a homology maps a line to a *parallel* line, so the direction the flank
+    gives is exact however wrong its height is — 0.000000 deg over a 600 mm
+    error in testing. All that moves is where the flank sits across the car,
+    and the step prints how much per 10 mm for the geometry in front of it.
+
+    With three levels a question becomes askable that two could not answer: how
+    far the marker sits from the flank, against half of ``--width-mm``. What is
+    left over is the marker's own offset from the centreline plus, when the
+    planes differ, the body's taper between them — two causes in one number, so
+    it is quoted and never corrected.
+
+    Everything is shown for approval before anything is written, and each
+    overlay is drawn on the plane that makes it mean something. The clicked
+    lines go back on their own levels, where they still land on the clicks that
+    made them. **The box is drawn on the lowest of the three** — its corners are
+    horizontal positions carrying no height of their own, so putting them on an
+    image is a choice, and the lowest level is the one that sets the outline on
+    the car's base rather than up at bumper height, standing proud of it by
+    exactly the parallax this step exists to remove. The gap between the box and
+    the front line is that parallax, and it is worth seeing. Nothing written
+    changes: this moves an overlay, not a millimetre.
+
+    When those overlays end up on different planes the check moves onto the
+    frame, since a flank drawn on the front plane's bird's-eye lands where it
+    *appears* from there rather than where it was clicked. Cancelling re-runs
+    the clicks; ``--no-preview`` skips it.
 
     The printed box size is the check that matters. A wrong ``--height-mm``
     leaves the trace perfectly square and tracking the car perfectly — the
@@ -1873,10 +1930,51 @@ def cmd_outline(a) -> None:
     K, _, R, t = calibration_planes(cal)
     y_up = camera_from_pose(R, t)[1] > 0
     H_stick, plane_note = car_plane(cal, a.sticker_height_mm)
-    H_out = homography_at_height(K, R, t, a.height_mm)
+    # Three levels, and each click is read on the plane its own feature sits at.
+    # A bird's-eye raster rectified to height p reports where a ray crosses p —
+    # so a feature *at* p reads its true horizontal position and needs no
+    # correction at all. That is why the levels reconcile with no arithmetic:
+    # marker, front edge and flank come back as the same world millimetres,
+    # measured on the same ground, and compose directly.
+    h_front = a.height_mm if a.front_height_mm is None else a.front_height_mm
+    h_side = a.height_mm if a.side_height_mm is None else a.side_height_mm
+    # The flank pass only exists in the two-click mode, so a second plane is only
+    # real when that pass will run. Otherwise --side-height-mm would quietly cost
+    # a raster and push the preview onto the frame for a line nobody clicks.
+    side_pass = bool(a.side and a.length_mm)
+    split = side_pass and h_side != h_front
+
+    # The box is *drawn* on the lowest of the three levels. Its corners are
+    # horizontal positions and carry no height of their own, so putting them
+    # back on an image is a choice, and the lowest plane is the one that puts
+    # them nearest the tarmac the footprint is finally measured on. Drawing at
+    # the front's height instead sits the outline up at bumper level, where it
+    # stands proud of the car's base by exactly the parallax this step exists to
+    # remove — pleasant to look at, and the wrong thing to check against.
+    # Nothing written changes: this moves an overlay, not a millimetre.
+    h_draw = min(a.sticker_height_mm, h_front, h_side if side_pass else h_front)
+    H_out = homography_at_height(K, R, t, h_front)
+    H_side = homography_at_height(K, R, t, h_side) if split else H_out
+    H_draw = (H_out if h_draw == h_front else
+              H_side if h_draw == h_side else homography_at_height(K, R, t, h_draw))
+    # Layers on different planes cannot share a raster: each would land where it
+    # *appears* from the other's viewpoint rather than where it belongs. The
+    # frame is the one surface they all project onto honestly.
+    on_frame = len({h_front, h_draw} | ({h_side} if side_pass else set())) > 1
+    if side_pass and not a.width_mm:
+        raise SystemExit("--side needs --width-mm: the flank fixes which side of the car "
+                         "the box starts from, and the tape gives how wide it runs.")
+    if a.side_height_mm is not None and not side_pass:
+        print("  NOTE: --side-height-mm does nothing without --side and --length-mm; the "
+              "flank is only clicked in the two-click mode. Ignoring it.", flush=True)
     und = undistort(load_image(a.image), cal["intrinsics"], str(a.image))
     print(f"  marker plane:  {plane_note}")
-    print(f"  outline plane: z = {a.height_mm:.0f} mm")
+    print(f"  front plane:   z = {h_front:.0f} mm")
+    if split:
+        print(f"  side plane:    z = {h_side:.0f} mm")
+    if h_draw != h_front:
+        print(f"  box drawn on:  z = {h_draw:.0f} mm — the lowest of the three, so the "
+              f"outline sits on the car's base and not up at bumper level")
 
     # 1. the marker centre, always on a bird's-eye of the marker's own plane.
     # Never on the frame, and never at the box's span: this is the one click the
@@ -1942,6 +2040,23 @@ def cmd_outline(a) -> None:
                   "offset was measured. The box will be built against the clicked "
                   "centre alone.", flush=True)
         else:
+            # The click is ground truth for where the marker is, so a match that
+            # lands further off than the template is itself wide has found some
+            # other object — not a template cut off-centre, which cannot exceed
+            # the template's own half-diagonal by definition. Storing one would
+            # put a metre of "offset" in the car file for --detector-offset to
+            # add to every frame of every run.
+            hard_mm = 0.5 * math.hypot(tpl.shape[1] * a.template_mm_per_px,
+                                       tpl.shape[0] * a.template_mm_per_px)
+            stray = float(np.linalg.norm(centre_mm - det_centre))
+            if stray > hard_mm:
+                print(f"  NOTE: the matcher settled {stray:.0f} mm from the marker you "
+                      f"clicked, which is further than the template is wide "
+                      f"({hard_mm:.0f} mm half-diagonal). That is a lock onto something "
+                      f"else, not an off-centre cut, so no detector offset is stored. "
+                      f"Check that --template is this station's marker.", flush=True)
+                det_centre = det_score = det_heading = None
+        if a.template and det_centre is not None:
             det_offset = centre_mm - det_centre
             print(f"  detector puts it at ({det_centre[0]:.1f}, {det_centre[1]:.1f}) mm, "
                   f"score {det_score:.3f}")
@@ -1954,7 +2069,7 @@ def cmd_outline(a) -> None:
     cam, up = camera_from_pose(R, t)
     cam = np.array([cam[0], cam[1], cam[2] * up])
     r_mm = float(np.linalg.norm(centre_mm - cam[:2]))
-    factor = r_mm / max(float(cam[2]) - a.height_mm, 1e-6)
+    factor = r_mm / max(float(cam[2]) - h_front, 1e-6)
 
     # 2. the box, read on the plane the box sits at
     centre_px_out = apply_h(np.linalg.inv(H_out), np.array([centre_mm]))[0]
@@ -1971,11 +2086,28 @@ def cmd_outline(a) -> None:
     if focus:
         print(f"  box view: opening on the car, {focus[2]:.0f} px across at native "
               f"resolution — wheel to zoom, r to fit the whole frame")
+
+    # The flank gets a raster of its own when it rides at its own height.
+    # Nothing about the pass changes except the millimetres a click is worth,
+    # which is the entire point of asking for a second height.
+    if split:
+        centre_px_side = apply_h(np.linalg.inv(H_side), np.array([centre_mm]))[0]
+        if a.space == "frame":
+            raster_s2, to_w_s2, _to_i_s2, note_s = plane_view(und, H_side, "frame")
+        else:
+            mm_sd = a.mm_per_px or round(plane_mm_per_px(H_side, centre_px_side), 2)
+            raster_s2, to_w_s2, _to_i_s2, note_s = plane_view(und, H_side, "bev", centre_mm,
+                                                              mm_sd, a.span_mm, 4000.0, y_up)
+        if note_s:
+            print(f"  side view: {note_s}")
+        focus_s = focus_on(H_side, centre_mm, 0.6 * (a.length_mm or 5000.0), a.space)
+    else:
+        raster_s2, to_w_s2, focus_s = raster_o, to_w_o, focus
     n_click = 2 if a.length_mm else 4
     while True:
         pts = picker.pick_points(
             raster_o,
-            f"Car box at {a.height_mm:.0f} mm — click "
+            f"Car box at {h_front:.0f} mm — click "
             + ("the 2 FRONT corners: front-left, front-right" if n_click == 2 else
                "4 corners: front-left, front-right, rear-right, rear-left"),
             n=n_click,
@@ -1992,13 +2124,13 @@ def cmd_outline(a) -> None:
         side = None
         if n_click == 2 and a.side:
             spts = picker.pick_points(
-                raster_o, "Now click 2 points along ONE side of the car",
+                raster_s2, f"Now click 2 points along ONE side of the car, at {h_side:.0f} mm",
                 n=2, hint="as far apart as you can get them — this sets the direction",
-                open_browser=not a.no_open, focus=focus)
+                open_browser=not a.no_open, focus=focus_s)
             if not spts:
                 print("  no side line — falling back to the front clicks alone", flush=True)
             else:
-                side = to_w_o(np.array([q["px"] for q in spts]))
+                side = to_w_s2(np.array([q["px"] for q in spts]))
 
         if n_click == 2 and side is not None:
             corners = build_box_from_front_and_side(clicked, side, centre_mm,
@@ -2034,6 +2166,32 @@ def cmd_outline(a) -> None:
                       f"is believed here because it is the longer baseline, so the box is "
                       f"still right — but a front click that far out of square usually "
                       f"means one of them is not on the bumper.", flush=True)
+
+            # The question three levels can be asked and two could not: where the
+            # flank sits across the car, against where the tape and the marker
+            # say it should. What is left over is the marker's own offset from
+            # the centreline, plus — when the planes differ — the body's taper
+            # between them. Two causes in one number, so it is quoted and never
+            # corrected; the box already takes its lateral position from the
+            # flank, which is the measured one of the two.
+            right_ = np.array([fwd[1], -fwd[0]])
+            reach = abs(float((centre_mm - side[0]) @ right_))
+            print(f"  marker sits {reach:.0f} mm from the flank across the car; half of "
+                  f"--width-mm is {a.width_mm / 2:.0f} mm -> {reach - a.width_mm / 2:+.0f} mm"
+                  + (" (marker off centre, and body taper between the two planes)" if split
+                     else " (marker off the centreline)"))
+
+            # A homology maps a line to a parallel line, so a wrong plane height
+            # cannot bend the direction a flank gives — that much is exact
+            # however wrong --side-height-mm is. What it moves is where the
+            # flank sits across the car, in proportion to how far the flank
+            # stands from under the camera.
+            if split:
+                lat = abs(float((side[0] - cam[:2]) @ right_))
+                sens = lat / max(float(cam[2]) - h_side, 1e-6)
+                print(f"  side-height sensitivity: 10 mm of error in --side-height-mm moves "
+                      f"the flank {10 * sens:.0f} mm across the car (x{sens:.2f}). The "
+                      f"direction it gives is unaffected.")
         elif n_click == 2:
             corners = build_box_from_front(clicked, centre_mm, a.length_mm, a.width_mm)
             print(f"  front edge clicked {click_width:.0f} mm wide; rear built "
@@ -2056,12 +2214,12 @@ def cmd_outline(a) -> None:
                 if implied > a.max_box_error_mm:
                     # Solved the other way, the clicked width says what height
                     # would have produced it — which is the number to pass next.
-                    h_implied = (float(cam[2]) - (float(cam[2]) - a.height_mm)
+                    h_implied = (float(cam[2]) - (float(cam[2]) - h_front)
                                  * a.width_mm / max(click_width, 1e-6))
                     print(f"  NOTE: that is more than {a.max_box_error_mm:.0f} mm of box "
                           f"error. Either the two clicks are not on the bumper corners, or "
                           f"--height-mm is wrong — these clicks imply the corners are "
-                          f"really at about {h_implied:.0f} mm, not {a.height_mm:.0f} mm.",
+                          f"really at about {h_implied:.0f} mm, not {h_front:.0f} mm.",
                           flush=True)
         else:
             corners = clicked
@@ -2086,20 +2244,40 @@ def cmd_outline(a) -> None:
         # a preview that agreed with itself but not with the file would be worse
         # than none. Grey marks are the raw clicks, so an adjustment is visible.
         line_name = ("adjusted front line" if (n_click == 2 and a.width_mm) else "front edge")
+        # Each overlay is drawn on the plane that makes it mean something: the
+        # box down on the lowest level, and each clicked line back on its own,
+        # where it still lands on the clicks that made it. Read together they
+        # show both halves of the check — the lines against what was clicked,
+        # the box against the car's base.
+        if on_frame:
+            review_img = und
+            def _to(H, w):
+                return apply_h(np.linalg.inv(H), w)
+        else:
+            review_img = raster_o
+            def _to(_H, w):
+                return to_i_o(w)
+        f_pts = _to(H_out, corners[:2])
+        b_pts = _to(H_draw, corners)
+        s_pts = None if side is None else _to(H_side, side)
+        m_pts = _to(H_out, clicked)
+        if s_pts is not None:
+            m_pts = np.vstack([m_pts, s_pts])
         layers = [
-            {"name": line_name, "points": to_i_o(corners[:2]).tolist(),
+            {"name": f"{line_name} @ {h_front:.0f}", "points": f_pts.tolist(),
              "closed": False, "colour": "#58a6ff", "on": True},
-            {"name": "car box", "points": to_i_o(corners).tolist(),
+            {"name": f"car box @ {h_draw:.0f}", "points": b_pts.tolist(),
              "closed": True, "colour": "#3fb950", "on": True},
         ]
-        if side is not None:
-            layers.insert(1, {"name": "side line", "points": to_i_o(side).tolist(),
+        if s_pts is not None:
+            layers.insert(1, {"name": f"side line @ {h_side:.0f}", "points": s_pts.tolist(),
                               "closed": False, "colour": "#d29922", "on": True})
         ok = picker.review_layers(
-            raster_o, "Check it, then save — or redo the clicks", layers,
-            marks=to_i_o(clicked if side is None
-                         else np.vstack([clicked, side])).tolist(),
-            hint="grey dots are your raw clicks; the buttons toggle each overlay",
+            review_img, "Check it, then save — or redo the clicks", layers,
+            marks=m_pts.tolist(),
+            hint=("grey dots are your raw clicks; the buttons toggle each overlay"
+                  + (" — on the frame, because the overlays sit on different planes"
+                     if on_frame else "")),
             open_browser=not a.no_open)
         if ok:
             break
@@ -2223,13 +2401,16 @@ def cmd_outline(a) -> None:
     # What a wrong height costs here. The height is the one number this step
     # takes on trust, and parallax scales with distance from the camera, so the
     # factor is a property of where the car is standing, not of the car.
-    print(f"  height sensitivity: 10 mm of error in --height-mm moves the box "
+    which_h = "--front-height-mm" if a.front_height_mm is not None else "--height-mm"
+    print(f"  height sensitivity: 10 mm of error in {which_h} moves the box "
           f"{10 * factor:.0f} mm here (x{factor:.2f})")
 
     save_json(a.out, {
         "car_id": a.name,
         "sticker_height_mm": float(a.sticker_height_mm),
-        "outline_height_mm": float(a.height_mm),
+        "outline_height_mm": float(h_front),
+        "front_height_mm": float(h_front),
+        "side_height_mm": (float(h_side) if side is not None else None),
         "built_from": "front-2" if n_click == 2 else "corners-4",
         "sticker_yaw_offset_deg": yaw,
         "length_mm": length,
@@ -2263,7 +2444,8 @@ def cmd_outline(a) -> None:
             "mm_per_px": (None if a.space == "frame" else mm_o),
         },
         "note": "body_polygon_mm and wheels_mm are in the sticker TEMPLATE frame; the "
-                "body was traced on the plane at outline_height_mm, the wheels are "
+                "body was traced on the plane at front_height_mm (the flank, when one "
+                "was clicked, on side_height_mm); the wheels are "
                 "contact patches on the ground; front/rear_bumper_mm are car-frame "
                 "distances from the marker",
     })
@@ -2520,6 +2702,14 @@ def main() -> None:
     p.add_argument("--height-mm", type=float, default=500.0,
                    help="Height of the corners you are clicking. Bumper corners sit near "
                         "500 mm; measure it, because the box error tracks this about 1:1.")
+    p.add_argument("--front-height-mm", type=float, default=None,
+                   help="Height of the FRONT corners, when they are not at --height-mm. "
+                        "Bumper corners sit near 500 mm.")
+    p.add_argument("--side-height-mm", type=float, default=None,
+                   help="Height of the flank feature the --side clicks follow, when it is "
+                        "not at --height-mm. A sill runs lower than a bumper corner and a "
+                        "shoulder crease runs higher, and clicking one on the other's "
+                        "plane moves it sideways.")
     p.add_argument("--length-mm", type=float, default=None,
                    help="Car length. Given, only the 2 FRONT corners are clicked and the "
                         "rear is built square to them — for when the far end is hidden.")
