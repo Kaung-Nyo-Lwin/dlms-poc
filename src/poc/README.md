@@ -38,6 +38,9 @@ python src/poc/calibrate.py intrinsics --video intrinsics/checkerboard.mp4 \
 python src/poc/calibrate.py frame --video $V --at 0  --out $S/gcp.png
 python src/poc/calibrate.py frame --video $V --at 22 --out $S/car.png
 
+# Ground marks only, which is all the pipelines require. Add
+# `--sticker-height-mm 1450` to survey the marker's plane as well — as a check
+# on it, or with `--pose-from all` as pose data. See the note below.
 python src/poc/calibrate.py gcp --image $S/gcp.png \
     --intrinsics intrinsics/test_harvest_fish.json \
     --out $S/calibration.json
@@ -71,7 +74,10 @@ two ground points and reads the distance back, for a tape to argue with — the
 so this is worth doing before trusting anything downstream. **`carplane`**
 surveys the marker's plane from poles standing on known marks, instead of
 raising `Z` through the camera pose. Both are checks; neither writes anything
-the pipelines require.
+the pipelines require. `gcp --sticker-height-mm` reaches the same targets from
+inside the survey rather than after it: it reads them against the plane the pose
+*builds* at that height, and `--pose-from all` will put them into the pose
+instead of patching one plane underneath it. See the `gcp` note below.
 
 Each interactive step prints a `http://127.0.0.1:…` URL and opens it. If your
 browser does not open (common under WSL), pass `--no-open` and click the URL.
@@ -119,6 +125,59 @@ Notes on the steps that have a trap in them:
   and it says the same thing on a flat pad and on a slope. Spread them over the
   area the car will actually occupy — a plane fitted to a 2 m square and
   extrapolated 5 m out is extrapolation, whatever the residual says.
+  **`--sticker-height-mm` surveys a second, optional set of control points on
+  the marker's own plane** — a target held at that height over a known ground
+  mark, clicked at the top, with the world `X, Y` of *the mark beneath it*
+  typed in. Same convention as `carplane`, and for the same reason: the
+  displacement between the two is parallax, and parallax is the only thing in
+  a survey that carries information about how high the camera is.
+
+  ```sh
+  python src/poc/calibrate.py gcp --image $S/gcp.png \
+      --intrinsics intrinsics/test_harvest_fish.json \
+      --sticker-height-mm 1450 --pose-from all \
+      --out $S/calibration.json
+  ```
+
+  They are used twice, and the first use needs no decision. **As a check**: the
+  ground marks say nothing about the plane every measurement is actually read
+  on, because they *are* the ground. The targets are read on the plane the pose
+  synthesises at their height, and how far they land from their marks is that
+  error in millimetres. On a synthetic station — four marks on an 1800 x
+  2200 mm square, camera 8 m up at 45°, marker plane at 1450 mm — half a pixel
+  of click jitter gives 1.6 mm on the ground and **15 mm on the marker's
+  plane**, with the camera's height 40 mm out; three pixels of hurried clicking
+  gives 39 mm on the ground and **156 mm on the marker's plane**, with the
+  height 413 mm out. Nothing in the ground residual moves anything like as far,
+  which is the whole point.
+
+  **As pose data, with `--pose-from all`**: both sets go into `solvePnP`
+  together. Ground marks alone are a planar problem — the pose comes out
+  determined, but its height rests on perspective across a single plane and is
+  the weakest number in it. Points on a second plane make the configuration
+  genuinely three-dimensional. On the runs above the camera centre came back
+  53 mm out from the marks alone and **7 mm** from all eight; in the hurried
+  case the height error fell from 413 mm to 30 mm. This corrects the pose
+  itself, so `H`, `rvec` and `tvec` all move together and every later step
+  inherits it — where `carplane` fixes one raised plane and leaves the pose it
+  disagrees with in place.
+
+  The trade runs the other way too. `--sticker-height-mm` becomes a **datum**
+  under `--pose-from all`: get it wrong, or hold one target at a different
+  height from the rest, and the fit absorbs the error by tilting the pose,
+  which moves the ground as well. Told the targets were at 1600 mm when they
+  stood at 1450, with otherwise perfect clicks, the ground residual went from
+  0.0 mm to 45 mm and the camera height 444 mm out. Under the default
+  `--pose-from ground` a wrong height costs nothing but the check, since the
+  pose never sees these points. **So run it as a check first, read the numbers,
+  and only then decide.** Two targets are the minimum and four are what make it
+  the eight points the pose wants; `--sticker-image` takes a different still,
+  for when the poles are not standing in the frame the ground marks were
+  clicked on. Everything is stored in a `sticker_plane` block — the clicks,
+  what they read under the written pose, and `synthesised_*`, what they read
+  under the ground-only pose before any of this could influence it. No
+  homography is stored there: the plane at that height is the pose's own, and
+  a stored copy is a copy that can go stale.
 - **`carplane`** — *optional, and the one step that measures rather than assumes.*
   Every other path to the marker's plane raises `Z` through the camera pose,
   which is exact only if the pose is. This stands poles at marker height over
@@ -572,6 +631,17 @@ beneath it. The ROIs are painted on the tarmac and are read on the field plane.
 The two only ever meet as world millimetres, never as pixels. Read the sticker
 on the ground plane instead and a roof marker lands metres away — about 2.0 m at
 B7 — while still looking entirely plausible.
+
+That synthesised plane is the one thing in the survey no ground residual can
+check, because the ground marks *are* the ground: four coplanar marks determine
+the tarmac exactly however wrong the camera's height is, and the error only
+appears once a plane is raised through the pose. `gcp --sticker-height-mm`
+measures it — control points held at marker height over known marks, read on the
+plane the pose builds for them. On a synthetic station, half a pixel of click
+jitter came back as 1.6 mm on the ground and **15 mm up there**; three pixels as
+39 mm against **156 mm**. `--pose-from all` then feeds those points into
+`solvePnP` alongside the marks, so the pose is fitted to both planes instead of
+to one and extrapolated to the other.
 
 **Car geometry is in the sticker template's frame, not the car's.** Origin at
 the sticker centre, +X along the template's *width* axis.

@@ -7,6 +7,8 @@ you choose, so a whole site lives in one directory.
     0  frame       grab one still to survey on
     1  intrinsics  checkerboard video      -> intrinsics.json
     2  gcp         click ground points     -> calibration.json
+                   --sticker-height-mm also surveys the marker's plane, as a
+                   check on it or, with --pose-from all, as pose data
     3  measure     check it against a tape (no output; do this before trusting it)
     3b carplane    survey the marker's plane  -> car block in calibration.json
     3c tape        check the survey's scale against tapes, and correct it
@@ -542,6 +544,60 @@ def cmd_intrinsics(a) -> None:
 # --------------------------------------------------------------------------
 
 
+def solve_pnp(K, obj_mm, img_px, seed=None):
+    """Camera pose from world millimetres to clicked pixels, then refined.
+
+    Every frame this is called on has already been undistorted, so PnP sees an
+    ideal pinhole camera: zero distortion is passed, or the lens correction is
+    applied twice.
+
+    ``seed`` decides which solver, and the two cases are not interchangeable.
+    Without one the object points must be coplanar, and IPPE is exact for them.
+    With one — always the ground-only pose — the points may span two heights,
+    which IPPE cannot accept at all; the solve then becomes a local refinement
+    of a pose that is already trusted rather than a global search free to land
+    on a mirror of it.
+    """
+    obj = np.asarray(obj_mm, dtype=np.float64).reshape(-1, 3)
+    img = np.asarray(img_px, dtype=np.float64).reshape(-1, 2)
+    zero = np.zeros(5)
+    if seed is None:
+        ok, rvec, tvec = cv2.solvePnP(obj, img, K, zero, flags=cv2.SOLVEPNP_IPPE)
+    else:
+        rvec = cv2.Rodrigues(np.asarray(seed[0], dtype=np.float64))[0]
+        tvec = np.asarray(seed[1], dtype=np.float64).reshape(3, 1).copy()
+        ok, rvec, tvec = cv2.solvePnP(obj, img, K, zero, rvec, tvec,
+                                      useExtrinsicGuess=True, flags=cv2.SOLVEPNP_ITERATIVE)
+    if not ok:
+        raise SystemExit("solvePnP failed; check that the world coordinates match the clicks")
+    rvec, tvec = cv2.solvePnPRefineLM(obj, img, K, zero, rvec, tvec)
+    return cv2.Rodrigues(rvec)[0], tvec.ravel()
+
+
+def reproj_px(K, R, t, obj_mm, img_px):
+    """Per-point reprojection error, in pixels."""
+    proj, _ = cv2.projectPoints(np.asarray(obj_mm, dtype=np.float64).reshape(-1, 3),
+                                cv2.Rodrigues(np.asarray(R, dtype=np.float64))[0],
+                                np.asarray(t, dtype=np.float64).reshape(3, 1),
+                                K, np.zeros(5))
+    return np.linalg.norm(
+        proj.reshape(-1, 2) - np.asarray(img_px, dtype=np.float64).reshape(-1, 2), axis=1)
+
+
+def plane_residual_mm(K, R, t, img_px, world_xy, height_mm):
+    """How far each click lands from its typed coordinate, read on the plane at that height.
+
+    For ground marks this is the residual the `gcp` step has always printed. For
+    a target held above the ground it is something the ground cannot report: the
+    plane at ``height_mm`` is built by raising Z through the pose, so this is
+    the first measurement in the survey that the camera's own height can be
+    wrong in.
+    """
+    H = homography_at_height(K, R, t, height_mm)
+    return np.linalg.norm(
+        apply_h(H, img_px) - np.asarray(world_xy, dtype=np.float64).reshape(-1, 2), axis=1)
+
+
 def cmd_gcp(a) -> None:
     """Click ground control points, type their world coordinates, solve the pose.
 
@@ -553,10 +609,54 @@ def cmd_gcp(a) -> None:
     Four points is the minimum and is exactly determined; six or more spread
     across the working area is what makes the residuals mean anything. Points
     clustered in one corner will fit beautifully and be wrong everywhere else.
+
+    **``--sticker-height-mm`` adds a second, optional set of control points on
+    the marker's own plane.** Hold a target at that height over a known ground
+    mark, click its top, and type the world X, Y of *the mark beneath it* — the
+    same convention as `carplane`, and for the same reason: the displacement
+    between the two is parallax, and parallax is the only thing in a survey that
+    carries information about how high the camera is. They are used twice.
+
+    * **As a check.** Everything that matters is read on the marker's plane, not
+      on the tarmac, and the ground marks cannot say anything about it. Four
+      coplanar marks determine the ground exactly, so their residuals stay at
+      click noise however wrong the camera height is; the error appears only
+      once a plane is raised through the pose. These targets are read on the
+      plane the pose *synthesises* at their height, and how far they land from
+      their marks is that error — in millimetres, for the first time.
+    * **As data, with ``--pose-from all``.** Ground marks alone are a planar
+      PnP: the pose comes out determined, but its height rests on perspective
+      across a single plane and is the weakest number in it. Points on a second
+      plane make the configuration genuinely three-dimensional, which is the
+      same parallax `carplane` exploits — except that this corrects the pose
+      itself, so the ground plane, every raised plane and the ``rvec``/``tvec``
+      every later step reads all move together, instead of one plane being
+      patched underneath a pose that still disagrees with it.
+
+    The trade runs the other way too, and is worth stating plainly.
+    ``--sticker-height-mm`` becomes a **datum** under ``--pose-from all``: get
+    it wrong, or hold one target at a different height from the rest, and the
+    fit absorbs the error by tilting the pose — which moves the ground as well,
+    somewhere no ground residual will show it. Under the default
+    ``--pose-from ground`` a wrong height costs nothing but the check, because
+    the pose never sees these points. So survey them as a check first, read the
+    numbers, and only then decide whether to let them into the pose.
     """
     intr = load_json(a.intrinsics)
     K, _, _ = intrinsics_arrays(intr)
     und = undistort(load_image(a.image), intr, str(a.image))
+
+    height_mm = a.sticker_height_mm
+    in_pose = a.pose_from == "all"
+    if in_pose and height_mm is None:
+        raise SystemExit(
+            "--pose-from all has nothing extra to solve with: it is the control points on "
+            "the marker's plane that make the configuration three-dimensional, and they are "
+            "only surveyed when --sticker-height-mm says how high they are")
+    if height_mm is not None and height_mm <= 0:
+        raise SystemExit(
+            f"--sticker-height-mm must be above the ground, got {height_mm} mm; targets "
+            "lying on the tarmac are ground control points and belong in the first pass")
 
     picked = picker.pick_points(
         und, "Ground control points — click a mark, type its world X,Y in mm",
@@ -571,21 +671,10 @@ def cmd_gcp(a) -> None:
     world = np.array([p["world_mm"] for p in picked], dtype=np.float64)
     obj_pts = np.column_stack([world, np.zeros(len(world))])
 
-    # The frame was already undistorted, so PnP sees an ideal pinhole camera:
-    # pass K with zero distortion, or the lens correction is applied twice.
-    zero = np.zeros(5)
-    flag = cv2.SOLVEPNP_IPPE if len(picked) >= 4 else cv2.SOLVEPNP_ITERATIVE
-    ok, rvec, tvec = cv2.solvePnP(obj_pts.astype(np.float64), img_pts, K, zero, flags=flag)
-    if not ok:
-        raise SystemExit("solvePnP failed; check that the world coordinates match the clicks")
-    rvec, tvec = cv2.solvePnPRefineLM(obj_pts, img_pts, K, zero, rvec, tvec)
-    R, _ = cv2.Rodrigues(rvec)
-    t = tvec.ravel()
-
-    proj, _ = cv2.projectPoints(obj_pts, rvec, tvec, K, zero)
-    res_px = np.linalg.norm(proj.reshape(-1, 2) - img_pts, axis=1)
-    H_field = homography_at_height(K, R, t, 0.0)
-    res_mm = np.linalg.norm(apply_h(H_field, img_pts) - world, axis=1)
+    R, t = solve_pnp(K, obj_pts, img_pts)
+    solver = "IPPE+LM"
+    res_px = reproj_px(K, R, t, obj_pts, img_pts)
+    res_mm = plane_residual_mm(K, R, t, img_pts, world, 0.0)
     centre, up = camera_from_pose(R, t)
     tilt = float(np.rad2deg(np.arccos(np.clip(-R[2, 2] * up, -1.0, 1.0))))
 
@@ -605,7 +694,119 @@ def cmd_gcp(a) -> None:
               "click on the wrong mark, not a bad camera. Check the worst point above.",
               flush=True)
 
-    save_json(a.out, {
+    # ---- optional: control points on the plane the marker rides on
+    sticker = None
+    if height_mm is not None:
+        s_und = und
+        if a.sticker_image is not None and Path(a.sticker_image) != Path(a.image):
+            s_und = undistort(load_image(a.sticker_image), intr, str(a.sticker_image))
+        s_picked = picker.pick_points(
+            s_und, f"Marker-plane control points at {height_mm:.0f} mm — click each target, "
+                   "type the world X,Y of the mark BENEATH it",
+            world=True,
+            hint="2 minimum, 4 is what makes it 8 points in all · the coordinate is the "
+                 "ground mark, never the target",
+            open_browser=not a.no_open)
+        if not s_picked:
+            raise SystemExit("cancelled — nothing surveyed on the marker's plane")
+        if len(s_picked) < 2:
+            raise SystemExit(
+                f"need at least 2 control points on the marker's plane, got {len(s_picked)}")
+
+        s_px = np.array([p["px"] for p in s_picked], dtype=np.float64)
+        s_world = np.array([p["world_mm"] for p in s_picked], dtype=np.float64)
+        # Z takes its sign from the camera, not from the frame: a world frame
+        # laid out left-handed puts +Z into the tarmac, and a target physically
+        # 1450 mm up then sits at Z = -1450. See camera_from_pose.
+        s_obj = np.column_stack([s_world, np.full(len(s_world), up * height_mm)])
+
+        # Read before anything is refitted. Once these points are in the pose
+        # they no longer test it, so this is the only moment the number exists.
+        chk_mm = plane_residual_mm(K, R, t, s_px, s_world, height_mm)
+        chk_px = reproj_px(K, R, t, s_obj, s_px)
+        print(f"  --- {len(s_picked)} control point(s) on the marker's plane at "
+              f"{height_mm:.0f} mm ---")
+        print("  read on the plane this pose synthesises there:")
+        print(f"  off their marks rms {chk_mm.mean():.1f} mm  max {chk_mm.max():.1f} mm"
+              f"   (reprojection rms {chk_px.mean():.2f} px  max {chk_px.max():.2f} px)")
+        for p, m, q in zip(s_picked, chk_mm, chk_px, strict=True):
+            print(f"    ({p['world_mm'][0]:8.1f}, {p['world_mm'][1]:8.1f}) mm   "
+                  f"{m:6.1f} mm   {q:5.2f} px")
+        if len(s_picked) < 3:
+            print("  NOTE: 2 targets have no redundancy — as a check they cannot tell a bad "
+                  "plane from a bad click, and in the pose they are four equations against "
+                  "one that already fits the ground. 3 or 4 is what makes this mean "
+                  "something.")
+        if chk_mm.max() > a.max_plane_residual_mm:
+            print(f"  NOTE: the ground marks fit to {res_mm.max():.0f} mm and these targets "
+                  f"miss theirs by {chk_mm.max():.0f} mm. Nothing need be wrong with the "
+                  f"ground — a raised plane is built through the camera's height, and that "
+                  f"is what this sees. It is the error every marker reading carries and no "
+                  f"ground residual can show. `--pose-from all` folds these points into the "
+                  f"pose; `carplane` fits the raised plane alone and leaves the pose "
+                  f"untouched.", flush=True)
+
+        # "chk" is the check above, frozen: what these points read on the plane
+        # the *ground-only* pose builds. "res" is what they read under whichever
+        # pose ends up written, and starts equal because that is the same pose
+        # until --pose-from all replaces it.
+        sticker = {"picked": s_picked, "px": s_px, "world": s_world, "obj": s_obj,
+                   "chk_mm": chk_mm, "chk_px": chk_px, "res_mm": chk_mm, "res_px": chk_px}
+
+    # ---- optional: solve the pose from both sets at once
+    if in_pose:
+        R0, t0, centre0, tilt0 = R, t, centre, tilt
+        res0_mm, chk0_mm = res_mm, sticker["chk_mm"]
+        R, t = solve_pnp(K, np.vstack([obj_pts, sticker["obj"]]),
+                         np.vstack([img_pts, sticker["px"]]), seed=(R0, t0))
+        centre, up_new = camera_from_pose(R, t)
+        # A refinement seeded on the ground pose has no business crossing the
+        # tarmac. If it did, the targets pulled the camera through the ground —
+        # which is what typing the target's own coordinates instead of the mark's
+        # looks like, since every point then wants zero parallax.
+        if up_new != up:
+            raise SystemExit(
+                "the combined solve put the camera on the other side of the ground from the "
+                "ground-only one. That is a mirror of the pose, not a refinement of it — "
+                "check that each marker-plane point was typed with the coordinates of the "
+                f"mark beneath it and that every target really stood {height_mm:.0f} mm up.")
+        tilt = float(np.rad2deg(np.arccos(np.clip(-R[2, 2] * up, -1.0, 1.0))))
+        res_px = reproj_px(K, R, t, obj_pts, img_pts)
+        res_mm = plane_residual_mm(K, R, t, img_pts, world, 0.0)
+        sticker["res_px"] = reproj_px(K, R, t, sticker["obj"], sticker["px"])
+        sticker["res_mm"] = plane_residual_mm(K, R, t, sticker["px"], sticker["world"],
+                                              height_mm)
+        solver = (f"IPPE+LM on the ground, then LM on "
+                  f"{len(picked)}+{len(sticker['picked'])} points")
+
+        shift = probe_shift(K, R0, t0, homography_at_height(K, R, t, 0.0),
+                            np.vstack([world, sticker["world"]]),
+                            und.shape[1], und.shape[0])
+        print(f"  --- pose re-solved from {len(picked)} ground + "
+              f"{len(sticker['picked'])} marker-plane points ---")
+        print(f"  camera  ({centre0[0]:.0f}, {centre0[1]:.0f}, {centre0[2] * up:.0f}) -> "
+              f"({centre[0]:.0f}, {centre[1]:.0f}, {centre[2] * up:.0f}) mm, moved "
+              f"{np.linalg.norm(centre - centre0):.0f} mm")
+        print(f"  tilt    {tilt0:.2f}° -> {tilt:.2f}° from nadir")
+        print(f"  on the ground rms {res_mm.mean():.1f} mm  max {res_mm.max():.1f} mm   "
+              f"(was {res0_mm.mean():.1f} / {res0_mm.max():.1f})")
+        print(f"  on the marker rms {sticker['res_mm'].mean():.1f} mm  "
+              f"max {sticker['res_mm'].max():.1f} mm   "
+              f"(was {chk0_mm.mean():.1f} / {chk0_mm.max():.1f})")
+        print(f"  reprojection  rms {res_px.mean():.2f} px   max {res_px.max():.2f} px")
+        if shift.size:
+            print(f"  the ground under the survey moves by {np.median(shift):.0f} mm typical, "
+                  f"{shift.max():.0f} mm worst")
+        if res_mm.max() > 50:
+            print("  NOTE: a ground residual over 50 mm after this is the fit trading the "
+                  "marks against the targets. Check --sticker-height-mm and that every "
+                  "target stood at it before keeping this pose.")
+        print("  the marker residual above is no longer a check — the pose was fitted to "
+              "those very points. What still checks it is a tape through `measure`, or "
+              "`carplane` on targets this solve never saw.", flush=True)
+
+    H_field = homography_at_height(K, R, t, 0.0)
+    cal = {
         "image_width": int(und.shape[1]),
         "image_height": int(und.shape[0]),
         "intrinsics": intr,
@@ -625,10 +826,35 @@ def cmd_gcp(a) -> None:
                 "center_mm": centre.tolist(),
                 "tilt_deg": tilt,
                 "reproj_rms_px": float(res_px.mean()),
-                "solver": "IPPE+LM",
+                "solver": solver,
             },
         },
-    })
+    }
+    if sticker is not None:
+        # Deliberately no homography here. The plane at this height is
+        # `homography_at_height` of the pose two keys up, and a stored copy of
+        # something derivable is a copy that can go stale — which is exactly the
+        # trap the `car` block has to be re-fitted out of whenever `tape` moves
+        # the pose. What is stored is what cannot be recomputed: the clicks, and
+        # what they read before this survey was allowed to influence anything.
+        cal["sticker_plane"] = {
+            "name": "sticker_plane",
+            "height_mm": float(height_mm),
+            "in_pose": in_pose,
+            "image": str(a.sticker_image or a.image),
+            "rms_error_mm": float(sticker["res_mm"].mean()),
+            "max_error_mm": float(sticker["res_mm"].max()),
+            "reproj_rms_px": float(sticker["res_px"].mean()),
+            "synthesised_rms_error_mm": float(sticker["chk_mm"].mean()),
+            "synthesised_max_error_mm": float(sticker["chk_mm"].max()),
+            "controls": [{"pixel": {"x": p["px"][0], "y": p["px"][1]},
+                          "world": {"x_mm": p["world_mm"][0], "y_mm": p["world_mm"][1]},
+                          "residual_mm": float(r),
+                          "synthesised_residual_mm": float(c)}
+                         for p, r, c in zip(sticker["picked"], sticker["res_mm"],
+                                            sticker["chk_mm"], strict=True)],
+        }
+    save_json(a.out, cal)
     print("  next: check it with `measure`, then cut the sticker template", flush=True)
 
 
@@ -1268,6 +1494,37 @@ def cmd_tape(a) -> None:
         cal.pop("car")
         print("  DROPPED the surveyed car plane: it was a homology of the old ground plane and "
               "its targets were not stored, so it cannot be re-fitted. Re-run `carplane`.")
+
+    # Marker-plane control points were a verdict on the *old* pose, and the pose
+    # has just moved. They cost a walk across the tarmac, so they are re-read on
+    # the new plane rather than dropped — but a stale residual must not be left
+    # standing beside a calibration it no longer describes.
+    sp = cal.get("sticker_plane")
+    if sp and sp.get("controls"):
+        s_px = np.array([[q["pixel"]["x"], q["pixel"]["y"]] for q in sp["controls"]],
+                        dtype=np.float64)
+        s_world = np.array([[q["world"]["x_mm"], q["world"]["y_mm"]] for q in sp["controls"]],
+                           dtype=np.float64)
+        s_h = float(sp["height_mm"])
+        s_res = plane_residual_mm(K, R_new, t_new, s_px, s_world, s_h)
+        s_obj = np.column_stack([s_world, np.full(len(s_world), up * s_h)])
+        for q, r in zip(sp["controls"], s_res, strict=True):
+            q["residual_mm"] = float(r)
+        sp["rms_error_mm"] = float(s_res.mean())
+        sp["max_error_mm"] = float(s_res.max())
+        sp["reproj_rms_px"] = float(reproj_px(K, R_new, t_new, s_obj, s_px).mean())
+        print(f"  re-read the {len(s_res)} marker-plane control point(s) at {s_h:.0f} mm on "
+              f"the new pose: rms {s_res.mean():.1f} mm, max {s_res.max():.1f} mm")
+        if sp.get("in_pose"):
+            # They were part of the pose `gcp` solved; this one is ground-and-tapes
+            # only, so they are back to being an outside check. Saying so is the
+            # whole point — the file would otherwise claim a three-dimensional
+            # solve that no longer exists.
+            sp["in_pose"] = False
+            print("  NOTE: those points were in the pose `gcp` solved. This re-solve uses "
+                  "the ground marks and the tapes alone, so they are an outside check "
+                  "again — and the camera height is back to resting on one plane's "
+                  "perspective. Re-run `gcp --pose-from all` if you want them back in.")
 
     save_json(a.out or a.calibration, cal)
     print("  written. car.json is now stale too — its body_polygon_mm and wheels_mm came from "
@@ -2607,6 +2864,24 @@ def main() -> None:
     p.add_argument("--image", required=True, type=Path)
     p.add_argument("--intrinsics", required=True, type=Path)
     p.add_argument("--out", required=True, type=Path)
+    p.add_argument("--sticker-height-mm", type=float, default=None,
+                   help="Also survey control points on the marker's plane, at this height "
+                        "above the ground. Click each raised target and type the world X,Y "
+                        "of the mark BENEATH it. Off by default: the ground marks alone are "
+                        "the existing survey, and this changes nothing about them.")
+    p.add_argument("--sticker-image", type=Path, default=None,
+                   help="Still to click those on, when the raised targets are not standing "
+                        "in --image. Default: --image.")
+    p.add_argument("--pose-from", choices=("ground", "all"), default="ground",
+                   help="Which points solve the pose. ground: the marks only, exactly as "
+                        "before, and the marker-plane points are a check on the plane the "
+                        "pose synthesises for them. all: both sets go into solvePnP, which "
+                        "makes the camera height observed rather than inferred from one "
+                        "plane's perspective — and makes --sticker-height-mm a datum the "
+                        "ground now depends on too.")
+    p.add_argument("--max-plane-residual-mm", type=float, default=50.0,
+                   help="Print a note when the marker-plane targets miss their marks by this "
+                        "much on the plane the pose synthesises for them.")
 
     p = add("measure", cmd_measure, "3. check the calibration against a tape")
     p.add_argument("--image", required=True, type=Path)
