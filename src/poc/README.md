@@ -7,6 +7,7 @@ nothing imports `dlms`.**
 | file | what it does |
 |---|---|
 | `calibrate.py` | the survey tool — every step, one folder of files |
+| `nudge_intrinsics.py` | borrow one camera's lens profile for another of the same model |
 | `picker.py` | the browser picking widget the survey steps use |
 | `pipeline1_bev.py` | warp each frame to the car plane, then match |
 | `pipeline2_raw.py` | match in the camera frame, then map the centre |
@@ -67,6 +68,27 @@ template against the survey frame to measure the detector offset, and because
 `sticker` is what prints the `--template-mm-per-px` the next two steps need. The
 numbers above are B4's: a 4630 x 1730 mm car, its marker 1450 mm up, bumper
 corners at 160 mm and the sill at ground level.
+
+**A camera without a checkerboard video of its own** can borrow one from another
+unit of the same model. `fx`, `fy` and the distortion coefficients belong to the
+part number and transplant exactly; the principal point belongs to how that
+sensor was bolted behind that lens, and does not. `nudge_intrinsics.py` re-solves
+`(cx, cy)` and the pose — and nothing else — against control points the `gcp`
+step has already surveyed:
+
+```sh
+python src/poc/nudge_intrinsics.py --calibration $S/calibration.json \
+    --out intrinsics/B7_nudged.json --out-calibration $S/calibration.json
+```
+
+It needs the two-height survey — `gcp --sticker-height-mm 1450 --pose-from all`
+— and refuses one that is all on the ground, because on a single plane a shifted
+principal point and a panned camera make the same picture and nothing separates
+them. It also refuses a shift it cannot distinguish from click noise: 8 points
+are 16 equations against 8 unknowns, so the reprojection RMS is not a check, and
+the gate is the fit's own sigma on `(cx, cy)` instead. See the file's header for
+what it costs and when it pays — briefly, below about 50 px of real offset there
+is nothing to win, and parallax buys more than points do.
 
 Two more steps exist and this workflow does not run them. **`measure`** clicks
 two ground points and reads the distance back, for a tape to argue with — the
