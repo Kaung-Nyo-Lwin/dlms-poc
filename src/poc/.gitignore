@@ -1,0 +1,5 @@
+# The borrowed-profile investigation's working. `focal_from_marker.py` is the
+# method it arrived at and is tracked; these are the experiments that found it —
+# one-shot scripts that read a POC folder (`poc/camera/fine_tune/`) kept outside
+# this repo, so they do not run from a clone and are not worth carrying in it.
+fine_tune_*.py

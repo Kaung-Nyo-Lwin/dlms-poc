@@ -8,6 +8,7 @@ nothing imports `dlms`.**
 |---|---|
 | `calibrate.py` | the survey tool — every step, one folder of files |
 | `nudge_intrinsics.py` | borrow one camera's lens profile for another of the same model |
+| `focal_from_marker.py` | and refit its focal length from the car's own roof marker |
 | `picker.py` | the browser picking widget the survey steps use |
 | `pipeline1_bev.py` | warp each frame to the car plane, then match |
 | `pipeline2_raw.py` | match in the camera frame, then map the centre |
@@ -89,6 +90,68 @@ are 16 equations against 8 unknowns, so the reprojection RMS is not a check, and
 the gate is the fit's own sigma on `(cx, cy)` instead. See the file's header for
 what it costs and when it pays — briefly, below about 50 px of real offset there
 is nothing to win, and parallax buys more than points do.
+
+**The nudge holds `fx`, `fy`, and on two real units of one model they did not
+agree.** Focal length is supposed to belong to the part number; two B7 cameras'
+board fits came out 30 px apart, which is 21 px of lens mapping at the edge of
+the working field, 44 mm of position error on ROIs 3.5 m outside the surveyed
+square, and 129 mm on a reported clearance — three times what two board sessions
+of *one* camera disagree by. The survey cannot find it: the pose absorbs a wrong
+principal point almost entirely, and what is left is monotone in `f` with no
+minimum to land on. Straightness cannot either, because a scale error leaves
+every straight line straight.
+
+The car carries what the ground does not. Its roof marker is a printed rectangle
+of fixed shape on a plane of known height, and the car takes it across the whole
+area on every run — so read its corners through a profile whose `f` is too small
+and the rectangle *grows* as the car drives away. `focal_from_marker.py` solves
+`fx`, `fy` to flatten that, with the marker's true size carried as a free
+nuisance parameter so no ruler is needed and a template cut at the wrong scale
+cannot bias it:
+
+```sh
+# a clip where the car crosses the scene, detected with --corner-pnp so the
+# marker's corners are measured rather than stamped back down from the template
+python src/poc/pipeline1_bev.py --video raw/B7/B7_entry.mp4 \
+    --calibration $S/calibration.json --car $S/car.json \
+    --template $S/sticker.png --template-mm-per-px 8.02 \
+    --corner-pnp --detector-offset --out $S/detect_entry.csv
+
+python src/poc/focal_from_marker.py --calibration $S/calibration.json \
+    --track $S/detect_entry.csv --template $S/sticker.png \
+    --out intrinsics/B7_marker.json \
+    --out-calibration $S/calibration_f.json \
+    --roi $S/roi.json --out-roi $S/roi_f.json
+```
+
+At B7, borrowing between two units and scoring on 601 frames of a drive-out the
+fit never saw: the lens gap fell 21.1 → 10.1 px, ROI position 44.5 → 11.1 mm,
+ROI clearance p95/max 128.6/148.4 → 48.0/68.0 mm, car box p95 125.1 → 79.7 mm,
+and the ROI hit flags differed on 5 frames instead of 18. Roughly **50 mm of
+total expected error** on a reported clearance — what two board calibrations of
+one camera disagree by, which left the borrowed profile closer to the station's
+own than that station's second board session was. Independently: the survey
+never chose `f`, yet its residuals improved (ground 22.0 → 20.5 mm, marker plane
+37.3 → 33.8, reprojection 7.57 → 6.85 px).
+
+It wants the same two-height survey the nudge does, and for a sharper reason:
+four coplanar marks fit *exactly* at any focal length, by putting the camera at
+the height that focal length implies, and the marker's plane is raised through
+that same pose. Delete B7's marker-plane controls and re-run the identical fit
+and it moves `f` 30 px the other way and leaves the marker still growing. It
+also wants **reach**, and refuses without it — coverage beats frame count by a
+wide margin: 10 frames spread over 1.6 to 8.9 m left 10 mm at the far ROIs where
+68 frames bunched inside 1.3 to 1.6 m left 133 mm, which is worse than doing
+nothing. The refusal fires on a real case: the second calibration of B7's *own*
+camera kept only 7 frames past 4 m, and the unguarded fit drove `fx` 80 px the
+wrong way.
+
+Like the nudge, it changes the undistorted frame — `P = K` projects it, so
+scaling `fx` slides every pixel towards or away from `(cx, cy)`. The control
+points and `--out-roi` come across because their sensor pixels are recoverable;
+the cut template and the traced outline are millimetres measured through the old
+profile, so re-run `sticker` and `outline` against the new calibration before
+tracking with it.
 
 Two more steps exist and this workflow does not run them. **`measure`** clicks
 two ground points and reads the distance back, for a tape to argue with — the
